@@ -42,6 +42,109 @@ func TestEvaluateManifestDivideRejectsZero(t *testing.T) {
 	}
 }
 
+func TestEvaluateManifestGetReadsMapByVariableKey(t *testing.T) {
+	// ComfyUI answers GET /history/{prompt_id} with an object keyed by the task
+	// id, which a static dotted path cannot express. The key comes from the
+	// environment, so "$get" has to resolve it at evaluation time.
+	env := map[string]any{
+		"taskId": "9f2c",
+		"node":   "3",
+		"response": map[string]any{"history": map[string]any{
+			"9f2c": map[string]any{"outputs": map[string]any{
+				"3": map[string]any{"images": []any{map[string]any{"filename": "cat.png"}}},
+			}},
+		}},
+	}
+	filename, err := evaluateManifestValue(map[string]any{
+		"$get": []any{
+			map[string]any{"$ref": "response.history"},
+			map[string]any{"$ref": "taskId"},
+		},
+	}, env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The variable key selects the whole history entry, which is still a node
+	// object the manifest can walk with ordinary path semantics.
+	if manifestPathValue(filename, "outputs.3.images.0.filename") != "cat.png" {
+		t.Fatalf("history entry = %#v", filename)
+	}
+	outputs, err := evaluateManifestValue(map[string]any{
+		"$get": []any{
+			map[string]any{"$get": []any{map[string]any{"$ref": "response.history"}, map[string]any{"$ref": "taskId"}}},
+			"outputs",
+		},
+	}, env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, err := evaluateManifestValue(map[string]any{"$get": []any{outputs, map[string]any{"$ref": "node"}}}, env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := evaluateManifestValue(map[string]any{"$at": []any{map[string]any{"$get": []any{node, "images"}}, 0}}, env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	value, err := evaluateManifestValue(map[string]any{"$get": []any{got, "filename"}}, env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value != "cat.png" {
+		t.Fatalf("filename = %#v", value)
+	}
+}
+
+func TestEvaluateManifestGetMissesYieldNilWithoutError(t *testing.T) {
+	env := map[string]any{
+		"missing": "unknown-id",
+		"object":  map[string]any{"known": "value", "null": nil},
+		"list":    []any{map[string]any{"name": "first"}},
+		"number":  float64(7),
+	}
+	// An absent key, a null value, a non-map source and a missing path are all
+	// data conditions, not malformed templates: they must resolve to nil so a
+	// manifest can coalesce them, exactly like "$at" out of range.
+	cases := []struct {
+		name    string
+		operand []any
+	}{
+		{"absent key", []any{map[string]any{"$ref": "object"}, map[string]any{"$ref": "missing"}}},
+		{"null value", []any{map[string]any{"$ref": "object"}, "null"}},
+		{"array source", []any{map[string]any{"$ref": "list"}, "name"}},
+		{"scalar source", []any{map[string]any{"$ref": "number"}, "name"}},
+		{"nil source", []any{map[string]any{"$ref": "nothing.here"}, "name"}},
+	}
+	for _, item := range cases {
+		value, err := evaluateManifestValue(map[string]any{"$get": item.operand}, env)
+		if err != nil {
+			t.Fatalf("%s: %v", item.name, err)
+		}
+		if value != nil {
+			t.Fatalf("%s = %#v, want nil", item.name, value)
+		}
+	}
+	coerced, err := evaluateManifestValue(map[string]any{"$coalesce": []any{
+		map[string]any{"$get": []any{map[string]any{"$ref": "object"}, "absent"}},
+		"fallback",
+	}}, env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if coerced != "fallback" {
+		t.Fatalf("coalesced = %#v", coerced)
+	}
+}
+
+func TestEvaluateManifestGetRejectsMalformedOperand(t *testing.T) {
+	for _, operand := range []any{"object", []any{map[string]any{}}, []any{map[string]any{}, "key", "extra"}} {
+		_, err := evaluateManifestValue(map[string]any{"$get": operand}, map[string]any{})
+		if err == nil || !strings.Contains(err.Error(), "$get requires [object, key]") {
+			t.Fatalf("operand %#v error = %v", operand, err)
+		}
+	}
+}
+
 func TestEvaluateManifestToFloatLeavesInvalidInputEmpty(t *testing.T) {
 	value, err := evaluateManifestValue(map[string]any{
 		"$coalesce": []any{

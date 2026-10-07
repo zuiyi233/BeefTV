@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 type ManifestOperation struct {
@@ -25,6 +26,25 @@ type ManifestOperation struct {
 	Body                any                `json:"body,omitempty"`
 	Fields              map[string]string  `json:"fields,omitempty"`
 	Files               []ManifestFilePart `json:"files,omitempty"`
+	// Policy is read only on the poll operation and declares the upstream's own
+	// suggested cadence. It is carried here because poll shares the operation
+	// shape with create, cancel and result; those ignore it.
+	Policy *PollPolicy `json:"policy,omitempty"`
+}
+
+// ManifestUpload declares an upload that runs before create. "foreach" is an
+// optional expression that must resolve to an array; the step executes once per
+// item with the current element bound as "item" and its position as "index", and
+// the captured values are collected as an array aligned with that input order.
+// Without "foreach" the step runs exactly once and captures a single object.
+//
+// "capture" names the fields taken from the decoded upload response. The mapping
+// is evaluated inside the protocol, so the host never sees an expression.
+type ManifestUpload struct {
+	ID        string            `json:"id"`
+	Foreach   any               `json:"foreach,omitempty"`
+	Operation ManifestOperation `json:"operation"`
+	Capture   map[string]any    `json:"capture,omitempty"`
 }
 
 type ManifestFilePart struct {
@@ -211,6 +231,32 @@ func (a metadataAdapter) BuildAgent(ctx context.Context, c AgentRequestContext) 
 	}
 	return adapter.BuildAgent(ctx, c)
 }
+
+// BuildUploadRequests / ApplyUploadResults 与 BuildCancelRequests 同构：宿主绑定的
+// 执行引擎自己声明预上传时才转发，否则回退成"无 uploads 声明"——空步骤、原样 context。
+func (a metadataAdapter) BuildUploadRequests(ctx context.Context, c UploadContext) ([]ManifestUploadStep, error) {
+	adapter, ok := a.delegate.(UploadAdapter)
+	if !ok {
+		return nil, nil
+	}
+	return adapter.BuildUploadRequests(ctx, c)
+}
+
+func (a metadataAdapter) ApplyUploadResults(ctx context.Context, c RequestContext, results []ManifestUploadResult) (RequestContext, error) {
+	adapter, ok := a.delegate.(UploadAdapter)
+	if !ok {
+		return c, nil
+	}
+	return adapter.ApplyUploadResults(ctx, c, results)
+}
+
+func (a metadataAdapter) PollPolicy() (PollPolicy, bool) {
+	adapter, ok := a.delegate.(PollPolicyAdapter)
+	if !ok {
+		return PollPolicy{}, false
+	}
+	return adapter.PollPolicy()
+}
 func (a metadataAdapter) ParseAgent(ctx context.Context, body []byte) (AgentResult, error) {
 	adapter, ok := a.delegate.(AgentAdapter)
 	if !ok {
@@ -306,6 +352,12 @@ func ValidateManifest(manifest Manifest) error {
 		if err := validateManifestOperation(provider.Create); err != nil {
 			return fmt.Errorf("provider %q create operation: %w", provider.ID, err)
 		}
+		if err := validateManifestUploads(provider); err != nil {
+			return err
+		}
+		if err := validateManifestPollPolicy(provider.ID, provider.Poll); err != nil {
+			return err
+		}
 		if provider.Agent != nil {
 			if err := validateManifestOperation(*provider.Agent); err != nil {
 				return fmt.Errorf("provider %q agent operation: %w", provider.ID, err)
@@ -386,6 +438,7 @@ func normalizeManifestForProvider(manifest *Manifest, index int) error {
 	manifest.Cancel = provider.Cancel
 	manifest.CancelOperations = provider.CancelOperations
 	manifest.ResultOperation = provider.Result
+	manifest.Uploads = provider.Uploads
 	manifest.Response = provider.Response
 	manifest.AgentResponse = provider.AgentResponse
 	manifest.Auth = provider.Auth
@@ -435,6 +488,65 @@ func validateManifestOperation(operation ManifestOperation) error {
 	return nil
 }
 
+// validateManifestUploads keeps the pre-create upload pass addressable: every
+// step needs a unique id because that id is the only handle create expressions
+// have on the captured values, and its operation must be a real outbound
+// request the host can execute.
+func validateManifestUploads(provider ManifestProvider) error {
+	seen := make(map[string]struct{}, len(provider.Uploads))
+	for index, upload := range provider.Uploads {
+		id := strings.TrimSpace(upload.ID)
+		if !validManifestUploadIdentifier(id) {
+			return fmt.Errorf("provider %q upload %d requires a usable id", provider.ID, index)
+		}
+		if _, exists := seen[id]; exists {
+			return fmt.Errorf("duplicate upload id %q for provider %q", id, provider.ID)
+		}
+		seen[id] = struct{}{}
+		if err := validateManifestOperation(upload.Operation); err != nil {
+			return fmt.Errorf("provider %q upload %q operation: %w", provider.ID, id, err)
+		}
+	}
+	return nil
+}
+
+// validManifestUploadIdentifier keeps an upload addressable rather than naming
+// it like a provider: captures are read as "$ref": "uploads.<id>.<index>", so a
+// dot or a space would break that path and a "$" would make the id read as an
+// operator node. camelCase ids such as "referenceImage" stay valid, which the
+// stricter provider identifier rule would not allow.
+func validManifestUploadIdentifier(value string) bool {
+	if value == "" || len(value) > 96 {
+		return false
+	}
+	for _, char := range value {
+		if char == '.' || char == '$' || char == '[' || char == ']' || unicode.IsSpace(char) {
+			return false
+		}
+	}
+	return true
+}
+
+// validateManifestPollPolicy range-checks the declared cadence without giving
+// the protocol an opinion on what the host should use when a knob is absent.
+// Zero is the absent value on this wire type, so an omitted knob never fails.
+func validateManifestPollPolicy(providerID string, poll *ManifestOperation) error {
+	if poll == nil || poll.Policy == nil {
+		return nil
+	}
+	policy := poll.Policy
+	if policy.IntervalSeconds < 0 || policy.IntervalSeconds > 300 {
+		return fmt.Errorf("provider %q poll policy intervalSeconds must be between 1 and 300", providerID)
+	}
+	if policy.TimeoutSeconds < 0 {
+		return fmt.Errorf("provider %q poll policy timeoutSeconds must not be negative", providerID)
+	}
+	if policy.TimeoutSeconds > 0 && policy.TimeoutSeconds <= policy.IntervalSeconds {
+		return fmt.Errorf("provider %q poll policy timeoutSeconds must be greater than intervalSeconds", providerID)
+	}
+	return nil
+}
+
 type manifestAdapter struct{ manifest Manifest }
 
 func (a manifestAdapter) Metadata() Metadata { return a.manifest.Metadata }
@@ -452,7 +564,7 @@ func (a manifestAdapter) BuildCreate(_ context.Context, c RequestContext) (Reque
 	if err := validateManifestRequest(a.manifest.Validations, c.Request); err != nil {
 		return RequestSpec{}, err
 	}
-	spec, err := buildManifestOperation(a.manifest.Create, a.manifest.Auth, c.Request, "")
+	spec, err := buildManifestOperation(a.manifest.Create, a.manifest.Auth, manifestOperationInput{Request: c.Request, Uploads: c.Uploads})
 	if err != nil {
 		return RequestSpec{}, err
 	}
@@ -492,7 +604,7 @@ func (a manifestAdapter) BuildAgent(_ context.Context, c AgentRequestContext) (R
 		return RequestSpec{}, fmt.Errorf("protocol %s has no agent operation", a.manifest.Metadata.ID)
 	}
 	request := GenerationRequest{Model: c.Model, Extra: map[string]any{"agent": c.Request}}
-	return buildManifestOperation(*a.manifest.Agent, a.manifest.Auth, request, "")
+	return buildManifestOperation(*a.manifest.Agent, a.manifest.Auth, manifestOperationInput{Request: request})
 }
 func (a manifestAdapter) ParseAgent(_ context.Context, body []byte) (AgentResult, error) {
 	if a.manifest.AgentResponse == nil {
@@ -570,7 +682,7 @@ func (a manifestAdapter) BuildPoll(_ context.Context, c PollContext) (RequestSpe
 	}
 	request := c.Request
 	request.Model = c.Model
-	return buildManifestOperation(*a.manifest.Poll, a.manifest.Auth, request, c.TaskID)
+	return buildManifestOperation(*a.manifest.Poll, a.manifest.Auth, manifestOperationInput{Request: request, TaskID: c.TaskID, Uploads: c.Uploads})
 }
 func (a manifestAdapter) ParsePoll(_ context.Context, c PollContext, body []byte) (PollResult, error) {
 	payload, err := decodeObject(body)
@@ -586,7 +698,7 @@ func (a manifestAdapter) BuildCancel(_ context.Context, c PollContext) (RequestS
 	}
 	request := c.Request
 	request.Model = c.Model
-	return buildManifestOperation(*a.manifest.Cancel, a.manifest.Auth, request, c.TaskID)
+	return buildManifestOperation(*a.manifest.Cancel, a.manifest.Auth, manifestOperationInput{Request: request, TaskID: c.TaskID, Uploads: c.Uploads})
 }
 
 // BuildCancelRequests 按声明顺序返回 cancel 与其补发请求。取消要覆盖排队与执行两种
@@ -599,7 +711,7 @@ func (a manifestAdapter) BuildCancelRequests(_ context.Context, c PollContext) (
 	request := c.Request
 	request.Model = c.Model
 	specs := make([]RequestSpec, 0, 1+len(a.manifest.CancelOperations))
-	primary, err := buildManifestOperation(*a.manifest.Cancel, a.manifest.Auth, request, c.TaskID)
+	primary, err := buildManifestOperation(*a.manifest.Cancel, a.manifest.Auth, manifestOperationInput{Request: request, TaskID: c.TaskID, Uploads: c.Uploads})
 	if err != nil {
 		return nil, err
 	}
@@ -608,7 +720,7 @@ func (a manifestAdapter) BuildCancelRequests(_ context.Context, c PollContext) (
 		if operation == nil {
 			continue
 		}
-		spec, err := buildManifestOperation(*operation, a.manifest.Auth, request, c.TaskID)
+		spec, err := buildManifestOperation(*operation, a.manifest.Auth, manifestOperationInput{Request: request, TaskID: c.TaskID, Uploads: c.Uploads})
 		if err != nil {
 			return nil, fmt.Errorf("cancel operation %d: %w", index, err)
 		}
@@ -623,14 +735,229 @@ func (a manifestAdapter) BuildResult(_ context.Context, c PollContext) (RequestS
 	}
 	request := c.Request
 	request.Model = c.Model
-	return buildManifestOperation(*a.manifest.ResultOperation, a.manifest.Auth, request, c.TaskID)
+	return buildManifestOperation(*a.manifest.ResultOperation, a.manifest.Auth, manifestOperationInput{Request: request, TaskID: c.TaskID, Uploads: c.Uploads})
+}
+
+// PollPolicy 暴露 poll.policy 声明的节奏。未声明时第二个返回值为 false：协议层不造
+// 默认值，宿主继续用它自己的外层调度（租约、not-found 预算这些本层不表达的语义）。
+func (a manifestAdapter) PollPolicy() (PollPolicy, bool) {
+	if a.manifest.Poll == nil || a.manifest.Poll.Policy == nil {
+		return PollPolicy{}, false
+	}
+	return *a.manifest.Poll.Policy, true
+}
+
+// manifestUploadIteration is one concrete upload the host has to perform: a
+// declared step bound to a single foreach element. BuildUploadRequests and
+// ApplyUploadResults replay the same plan, so a capture is always applied to the
+// exact item and index its request was built for.
+type manifestUploadIteration struct {
+	id        string
+	index     int
+	foreach   bool
+	item      any
+	operation ManifestOperation
+	capture   map[string]any
+	request   GenerationRequest
+}
+
+func (a manifestAdapter) uploadPlan(request GenerationRequest) ([]manifestUploadIteration, error) {
+	if len(a.manifest.Uploads) == 0 {
+		return nil, nil
+	}
+	plan := make([]manifestUploadIteration, 0, len(a.manifest.Uploads))
+	for _, upload := range a.manifest.Uploads {
+		id := strings.TrimSpace(upload.ID)
+		if upload.Foreach == nil {
+			plan = append(plan, manifestUploadIteration{id: id, operation: upload.Operation, capture: upload.Capture, request: request})
+			continue
+		}
+		value, err := evaluateManifestValue(upload.Foreach, map[string]any{"request": manifestRequestValues(request), "uploads": newManifestUploadValues(a.manifest.Uploads)})
+		if err != nil {
+			return nil, fmt.Errorf("upload %q foreach: %w", id, err)
+		}
+		items, ok := value.([]any)
+		if !ok {
+			return nil, fmt.Errorf("upload %q foreach must resolve to an array", id)
+		}
+		for index, item := range items {
+			plan = append(plan, manifestUploadIteration{id: id, index: index, foreach: true, item: item, operation: upload.Operation, capture: upload.Capture, request: request})
+		}
+	}
+	return plan, nil
+}
+
+// BuildUploadRequests 按声明顺序展开 uploads，产出宿主需要逐个执行的步骤。协议层不发
+// 任何出站请求：执行尚未发生，所以步骤表达式看到的 uploads 只有声明过的键、值为空。
+// 同一次预上传里让后一步引用前一步的捕获在本层不可表达，那需要宿主分轮执行再回喂结果。
+func (a manifestAdapter) BuildUploadRequests(_ context.Context, c UploadContext) ([]ManifestUploadStep, error) {
+	plan, err := a.uploadPlan(c.Request)
+	if err != nil {
+		return nil, err
+	}
+	if len(plan) == 0 {
+		return nil, nil
+	}
+	uploads := newManifestUploadValues(a.manifest.Uploads)
+	steps := make([]ManifestUploadStep, 0, len(plan))
+	for _, iteration := range plan {
+		spec, err := buildManifestOperation(iteration.operation, a.manifest.Auth, manifestOperationInput{
+			Request: iteration.request,
+			Uploads: uploads,
+			Extras:  map[string]any{"item": iteration.item, "index": iteration.index},
+		})
+		if err != nil {
+			return nil, fmt.Errorf("upload %q step %d: %w", iteration.id, iteration.index, err)
+		}
+		if err := spec.Validate(); err != nil {
+			return nil, fmt.Errorf("upload %q step %d: %w", iteration.id, iteration.index, err)
+		}
+		steps = append(steps, ManifestUploadStep{ID: iteration.id, Index: iteration.index, Request: spec})
+	}
+	return steps, nil
+}
+
+// ApplyUploadResults 把宿主执行并解码后的响应交给 manifest 的 capture 映射，按声明顺序
+// 重放同一份迭代计划，因此每个 capture 都能看到此前已完成的捕获（含同一 id 的已完成前缀）。
+// 缺结果、未知 id 或重复下标都是宿主与计划不一致的真实故障，必须报错，不能静默留下空洞。
+func (a manifestAdapter) ApplyUploadResults(_ context.Context, c RequestContext, results []ManifestUploadResult) (RequestContext, error) {
+	if len(a.manifest.Uploads) == 0 {
+		if len(results) > 0 {
+			return RequestContext{}, fmt.Errorf("protocol %s declares no uploads but received %d upload results", a.manifest.Metadata.ID, len(results))
+		}
+		return c, nil
+	}
+	plan, err := a.uploadPlan(c.Request)
+	if err != nil {
+		return RequestContext{}, err
+	}
+	pending, err := indexManifestUploadResults(a.manifest.Uploads, plan, results)
+	if err != nil {
+		return RequestContext{}, err
+	}
+	captured := newManifestUploadValues(a.manifest.Uploads)
+	requestValues := manifestRequestValues(c.Request)
+	for _, iteration := range plan {
+		result, ok := pending[manifestUploadKey(iteration.id, iteration.index)]
+		if !ok {
+			return RequestContext{}, fmt.Errorf("upload %q step %d has no result", iteration.id, iteration.index)
+		}
+		env := map[string]any{
+			"response": result.Values,
+			"item":     iteration.item,
+			"index":    iteration.index,
+			"request":  requestValues,
+			"uploads":  cloneManifestUploadValues(captured),
+		}
+		entry, err := applyManifestUploadCapture(iteration.capture, env)
+		if err != nil {
+			return RequestContext{}, fmt.Errorf("upload %q step %d: %w", iteration.id, iteration.index, err)
+		}
+		if iteration.foreach {
+			items, _ := captured[iteration.id].([]any)
+			captured[iteration.id] = append(items, entry)
+			continue
+		}
+		captured[iteration.id] = entry
+	}
+	c.Uploads = captured
+	return c, nil
+}
+
+// applyManifestUploadCapture 逐个求值 capture 的具名字段：键名是字面量，不参与表达式
+// 语义；求值为 nil 的字段省略，与 manifest 其余映射的丢空语义一致。
+func applyManifestUploadCapture(capture map[string]any, env map[string]any) (map[string]any, error) {
+	result := make(map[string]any, len(capture))
+	for key, template := range capture {
+		name := strings.TrimSpace(key)
+		if name == "" {
+			return nil, fmt.Errorf("capture field name must not be empty")
+		}
+		value, err := evaluateManifestValue(template, env)
+		if err != nil {
+			return nil, fmt.Errorf("capture field %q: %w", name, err)
+		}
+		if value != nil {
+			result[name] = value
+		}
+	}
+	return result, nil
+}
+
+// newManifestUploadValues 给出声明的骨架：带 foreach 的 id 是数组，不带的就是单个对象。
+// BuildUploadRequests 用它作执行前的空快照，ApplyUploadResults 在其上逐项填充。
+func newManifestUploadValues(uploads []ManifestUpload) map[string]any {
+	result := make(map[string]any, len(uploads))
+	for _, upload := range uploads {
+		id := strings.TrimSpace(upload.ID)
+		if upload.Foreach != nil {
+			result[id] = []any{}
+			continue
+		}
+		result[id] = map[string]any{}
+	}
+	return result
+}
+
+// cloneManifestUploadValues snapshots the progress so an earlier capture cannot
+// be rewritten through the environment a later capture is evaluated with.
+func cloneManifestUploadValues(values map[string]any) map[string]any {
+	result := make(map[string]any, len(values))
+	for key, value := range values {
+		if items, ok := value.([]any); ok {
+			copied := make([]any, len(items))
+			copy(copied, items)
+			result[key] = copied
+			continue
+		}
+		result[key] = value
+	}
+	return result
+}
+
+func manifestUploadEnvValues(values map[string]any) map[string]any {
+	if values == nil {
+		return map[string]any{}
+	}
+	return values
+}
+
+func manifestUploadKey(id string, index int) string {
+	return id + "\x00" + strconv.Itoa(index)
+}
+
+func indexManifestUploadResults(uploads []ManifestUpload, plan []manifestUploadIteration, results []ManifestUploadResult) (map[string]ManifestUploadResult, error) {
+	declared := make(map[string]struct{}, len(uploads))
+	for _, upload := range uploads {
+		declared[strings.TrimSpace(upload.ID)] = struct{}{}
+	}
+	expected := make(map[string]struct{}, len(plan))
+	for _, iteration := range plan {
+		expected[manifestUploadKey(iteration.id, iteration.index)] = struct{}{}
+	}
+	indexed := make(map[string]ManifestUploadResult, len(results))
+	for _, result := range results {
+		id := strings.TrimSpace(result.ID)
+		if _, ok := declared[id]; !ok {
+			return nil, fmt.Errorf("upload result %q is not declared by the manifest", id)
+		}
+		key := manifestUploadKey(id, result.Index)
+		if _, ok := expected[key]; !ok {
+			return nil, fmt.Errorf("upload result %q has no step at index %d", id, result.Index)
+		}
+		if _, duplicate := indexed[key]; duplicate {
+			return nil, fmt.Errorf("duplicate upload result for %q at index %d", id, result.Index)
+		}
+		indexed[key] = result
+	}
+	return indexed, nil
 }
 
 func (a manifestAdapter) parse(payload map[string]any, c PollContext) CreateResult {
 	response := a.manifest.Response
 	// baseUrl 让响应映射能把上游给的相对路径拼成可访问的绝对地址：本地部署的
 	// ComfyUI 只回 subfolder/filename，结果端点本身在同一个 origin 下。
-	env := map[string]any{"response": payload, "taskId": c.TaskID, "baseUrl": c.BaseURL, "request": manifestRequestValues(c.Request)}
+	env := map[string]any{"response": payload, "taskId": c.TaskID, "baseUrl": c.BaseURL, "request": manifestRequestValues(c.Request), "uploads": manifestUploadEnvValues(c.Uploads)}
 	id := manifestResponseString(response.TaskID, env)
 	if id == "" {
 		id = firstPathValue(payload, response.TaskIDPaths...)
@@ -888,9 +1215,25 @@ func mediaPathValues(payload map[string]any, path string) []string {
 	return values
 }
 
-func buildManifestOperation(operation ManifestOperation, auth ManifestAuth, request GenerationRequest, taskID string) (RequestSpec, error) {
+// manifestOperationInput is the expression input for one outbound request. The
+// "uploads" environment key is always present, so a manifest that reads a
+// capture sees a stable shape instead of a missing key. Extras carry the
+// per-iteration bindings the uploads pass needs ("item", "index") without
+// widening every other call site.
+type manifestOperationInput struct {
+	Request GenerationRequest
+	TaskID  string
+	Uploads map[string]any
+	Extras  map[string]any
+}
+
+func buildManifestOperation(operation ManifestOperation, auth ManifestAuth, input manifestOperationInput) (RequestSpec, error) {
+	request, taskID := input.Request, input.TaskID
 	requestValues := manifestRequestValues(request)
-	env := map[string]any{"request": requestValues, "taskId": taskID}
+	env := map[string]any{"request": requestValues, "taskId": taskID, "uploads": manifestUploadEnvValues(input.Uploads)}
+	for key, value := range input.Extras {
+		env[key] = value
+	}
 	var body any
 	if operation.Body != nil {
 		value, err := evaluateManifestValue(operation.Body, env)
@@ -1176,7 +1519,23 @@ func manifestRequestValues(request GenerationRequest) map[string]any {
 		"output":          outputValue,
 		"providerOptions": request.ProviderOptions,
 		"extra":           request.Extra,
+		"workflow":        manifestWorkflowValues(request.Workflow),
 	}
+}
+
+// manifestWorkflowValues projects the host-mapped workflow graph into the JSON
+// view of the request. An absent workflow stays nil instead of an empty object,
+// so "$ref: request.workflow.json" resolves to nothing rather than to a node
+// every manifest would have to test for.
+func manifestWorkflowValues(workflow *WorkflowPayload) any {
+	if workflow == nil {
+		return nil
+	}
+	value, err := requestAsManifestValue(workflow)
+	if err != nil {
+		return nil
+	}
+	return value
 }
 
 func hasSystemMessage(messages []Message) bool {

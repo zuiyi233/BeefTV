@@ -73,6 +73,15 @@ type Message struct {
 	Content any    `json:"content"`
 }
 
+// WorkflowPayload is the host-mapped workflow graph for graph-based upstreams
+// (ComfyUI-style node bundles). Field mapping, node ids and the client id stay
+// host responsibilities; the protocol only projects the finished graph into the
+// request environment so a declarative create can place it into the payload.
+type WorkflowPayload struct {
+	JSON     map[string]any `json:"json,omitempty"`
+	ClientID string         `json:"clientId,omitempty"`
+}
+
 // GenerationRequest is the platform contract shared by canvas, creation and agent.
 // Provider-specific fields belong in Extra and are never interpreted by the host.
 type GenerationRequest struct {
@@ -96,11 +105,19 @@ type GenerationRequest struct {
 	Output          OutputOptions             `json:"output,omitempty"`
 	ProviderOptions map[string]map[string]any `json:"providerOptions,omitempty"`
 	Extra           map[string]any            `json:"extra,omitempty"`
+	// Workflow carries the graph the host already mapped for graph-based
+	// upstreams. It is nil for every protocol that does not consume a workflow,
+	// so the request environment keeps the key absent rather than an empty node.
+	Workflow *WorkflowPayload `json:"workflow,omitempty"`
 }
 
 type RequestContext struct {
 	BaseURL string
 	Request GenerationRequest
+	// Uploads holds the values captured by the pre-create uploads pass, replayed
+	// through UploadAdapter.ApplyUploadResults. It is exposed to create
+	// expressions as the top-level "uploads" environment key.
+	Uploads map[string]any
 }
 
 type PollContext struct {
@@ -109,6 +126,10 @@ type PollContext struct {
 	Request  GenerationRequest
 	TaskID   string
 	Metadata map[string]any
+	// Uploads is the same capture map the create call received. Poll, cancel and
+	// result run after the submission, so the host has to carry the values it
+	// captured (or restored from the persisted task) back into this context.
+	Uploads map[string]any
 }
 
 type RequestSpec struct {
@@ -206,6 +227,7 @@ type Manifest struct {
 	Cancel           *ManifestOperation     `json:"-"`
 	CancelOperations []*ManifestOperation   `json:"-"`
 	ResultOperation  *ManifestOperation     `json:"-"`
+	Uploads          []ManifestUpload       `json:"-"`
 	Response         ManifestResponse       `json:"-"`
 	AgentResponse    *ManifestAgentResponse `json:"-"`
 	Auth             ManifestAuth           `json:"-"`
@@ -311,6 +333,7 @@ type ManifestProvider struct {
 	Parameters              []Parameter          `json:"parameters,omitempty"`
 	Validations             []ManifestValidation `json:"validations,omitempty"`
 	Create                  ManifestOperation    `json:"create"`
+	Uploads                 []ManifestUpload     `json:"uploads,omitempty"`
 	Agent                   *ManifestOperation   `json:"agent,omitempty"`
 	Poll                    *ManifestOperation   `json:"poll,omitempty"`
 	Cancel                  *ManifestOperation   `json:"cancel,omitempty"`
@@ -378,4 +401,41 @@ func (r RequestSpec) Validate() error {
 		return fmt.Errorf("protocol file parts require multipart/form-data")
 	}
 	return nil
+}
+
+// PollPolicy is the cadence a provider declares for its own poll loop. It is a
+// hint, not a lease: the host keeps the outer schedule, not-found budgets and
+// recovery, and this protocol type carries only the two knobs a plugin can know
+// better than the host. Zero means "not declared"; PollPolicyAdapter reports
+// that as false instead of inventing a default.
+type PollPolicy struct {
+	IntervalSeconds int `json:"intervalSeconds,omitempty"`
+	TimeoutSeconds  int `json:"timeoutSeconds,omitempty"`
+}
+
+// UploadContext is the input for the pre-create uploads pass. It mirrors
+// RequestContext because the pass runs against the same platform request the
+// create call will use.
+type UploadContext struct {
+	BaseURL string
+	Request GenerationRequest
+}
+
+// ManifestUploadStep is one upload the host must execute before create. It
+// deliberately carries no expression surface: the protocol resolves every
+// template, so the host only sends a ready request and returns the decoded
+// response body. Capture templates never leave the protocol.
+type ManifestUploadStep struct {
+	ID      string
+	Index   int
+	Request RequestSpec
+}
+
+// ManifestUploadResult is the decoded response for one executed step, keyed by
+// the step it answers. Values is the provider JSON object as decoded by the
+// host; the protocol applies the manifest's capture mapping to it.
+type ManifestUploadResult struct {
+	ID     string
+	Index  int
+	Values map[string]any
 }

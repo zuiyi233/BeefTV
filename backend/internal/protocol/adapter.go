@@ -48,6 +48,31 @@ type CancelRequestsAdapter interface {
 	BuildCancelRequests(context.Context, PollContext) ([]RequestSpec, error)
 }
 
+// UploadAdapter is the optional protocol surface for providers that have to
+// receive local media before the task can be submitted, such as ComfyUI storing
+// a reference image through POST /upload/image and then addressing it by the
+// name, subfolder and type the server chose.
+//
+// The protocol only builds requests and folds decoded responses back into the
+// request environment. It never performs an outbound call: credentials, SSRF
+// policy, timeouts, file decoding and receipts stay with the host, exactly as
+// they do for create, cancel and result. BuildUploadRequests expands every
+// declared foreach source into the steps to run in order; ApplyUploadResults
+// takes the decoded responses for those steps, evaluates the manifest capture
+// mapping itself, and returns the context whose create/poll/cancel/result
+// expressions can read the captured values through the "uploads" key.
+type UploadAdapter interface {
+	BuildUploadRequests(context.Context, UploadContext) ([]ManifestUploadStep, error)
+	ApplyUploadResults(context.Context, RequestContext, []ManifestUploadResult) (RequestContext, error)
+}
+
+// PollPolicyAdapter exposes the poll cadence a provider declared for itself.
+// The second result is false when the manifest does not declare a policy, so
+// the host keeps its own rhythm instead of receiving a protocol default.
+type PollPolicyAdapter interface {
+	PollPolicy() (PollPolicy, bool)
+}
+
 type AgentRequestContext struct {
 	BaseURL string
 	Model   string

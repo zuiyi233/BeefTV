@@ -234,6 +234,33 @@ func evaluateManifestOperator(operator string, operand any, env map[string]any) 
 			return nil, nil
 		}
 		return items[index], nil
+	case "$get":
+		// Map lookup by a key that is only known at runtime. "$ref" paths are
+		// static, so an upstream object keyed by the task id — ComfyUI's
+		// GET /history/{prompt_id} response — cannot be addressed otherwise.
+		// A non-map input, an absent key or a null value is a miss and yields
+		// nil without an error, matching how "$at" treats an out-of-range index.
+		values, ok := operand.([]any)
+		if !ok || len(values) != 2 {
+			return nil, fmt.Errorf("$get requires [object, key]")
+		}
+		object, err := evaluateManifestValue(values[0], env)
+		if err != nil {
+			return nil, err
+		}
+		key, err := evaluateManifestValue(values[1], env)
+		if err != nil {
+			return nil, err
+		}
+		container := manifestObject(object)
+		if container == nil {
+			return nil, nil
+		}
+		entry, ok := container[manifestString(key)]
+		if !ok {
+			return nil, nil
+		}
+		return entry, nil
 	case "$len":
 		value, err := evaluateManifestValue(operand, env)
 		if err != nil {
