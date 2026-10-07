@@ -356,8 +356,9 @@ func (s *Service) RequireForUser(userID string, pluginID string) error {
 }
 
 func (s *Service) WorkflowStatuses() map[string]string {
-	statuses := make(map[string]string, 1)
-	for _, pluginID := range []string{WorkflowRunningHub} {
+	ids := BundledWorkflowPluginIDs()
+	statuses := make(map[string]string, len(ids))
+	for _, pluginID := range ids {
 		state, err := s.stateForUser(nil, pluginID, s.List())
 		if err == nil && state.PlatformAvailable {
 			statuses[pluginID] = StatusEnabled
@@ -369,10 +370,11 @@ func (s *Service) WorkflowStatuses() map[string]string {
 }
 
 func (s *Service) WorkflowStatusesForUser(userID string) (map[string]string, error) {
-	statuses := make(map[string]string, 1)
+	ids := BundledWorkflowPluginIDs()
+	statuses := make(map[string]string, len(ids))
 	actor := &model.User{ID: strings.TrimSpace(userID)}
 	items := s.List()
-	for _, pluginID := range []string{WorkflowRunningHub} {
+	for _, pluginID := range ids {
 		state, err := s.stateForUser(actor, pluginID, items)
 		if err != nil {
 			return nil, err
@@ -393,10 +395,7 @@ func (s *Service) RequireWorkflowForInterface(interfaceType string) error {
 	}
 	status, exists := s.WorkflowStatuses()[pluginID]
 	if !exists || status != StatusEnabled {
-		if pluginID == WorkflowRunningHub {
-			return Forbidden("RunningHub 工作流插件未启用")
-		}
-		return Forbidden("工作流插件未启用")
+		return Forbidden(WorkflowDisplayName(pluginID) + "未启用")
 	}
 	return nil
 }
@@ -407,10 +406,7 @@ func (s *Service) RequireWorkflowForUser(userID string, interfaceType string) er
 		return Forbidden("未知工作流插件")
 	}
 	if err := s.RequireForUser(userID, pluginID); err != nil {
-		if pluginID == WorkflowRunningHub {
-			return Forbidden("RunningHub 工作流插件未启用")
-		}
-		return Forbidden("工作流插件未启用")
+		return Forbidden(WorkflowDisplayName(pluginID) + "未启用")
 	}
 	return nil
 }

@@ -8,6 +8,7 @@ const (
 	MediaConversion     = "media-conversion"
 	EditorShell         = "editor-shell"
 	WorkflowRunningHub  = "runninghub-workflow-provider"
+	WorkflowComfyUI     = "comfyui-workflow-provider"
 
 	OriginOfficial = "official"
 	OriginSystem   = "system"

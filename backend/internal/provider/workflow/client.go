@@ -64,6 +64,9 @@ func (c *Client) Run(ctx context.Context, input Input) (map[string]interface{}, 
 	if isRunningHubInterface(input.Config.InterfaceType) {
 		return exec.runRunningHub(ctx, input)
 	}
+	if isComfyUIInterface(input.Config.InterfaceType) {
+		return exec.runComfyUI(ctx, input)
+	}
 	if err := exec.requireActor(ctx, input.Config.InterfaceType); err != nil {
 		return nil, err
 	}
@@ -73,6 +76,11 @@ func (c *Client) Run(ctx context.Context, input Input) (map[string]interface{}, 
 // RunRunningHub submits or resumes a RunningHub workflow/app task.
 func (c *Client) RunRunningHub(ctx context.Context, input Input) (map[string]interface{}, error) {
 	return c.prepared().runRunningHub(ctx, input)
+}
+
+// RunComfyUI submits or resumes a native ComfyUI workflow.
+func (c *Client) RunComfyUI(ctx context.Context, input Input) (map[string]interface{}, error) {
+	return c.prepared().runComfyUI(ctx, input)
 }
 
 func (c *Client) runRunningHub(ctx context.Context, input Input) (map[string]interface{}, error) {
@@ -400,6 +408,17 @@ func (c *Client) pollLegacy(ctx context.Context, config Config, root string, tas
 
 // DownloadOutputs fetches and normalizes output URLs. policy != nil uses video download retries.
 func (c *Client) DownloadOutputs(ctx context.Context, urls []string, taskID string, policy *PollPolicy) (map[string]interface{}, error) {
+	return c.downloadOutputs(ctx, urls, taskID, policy, "RunningHub")
+}
+
+// DownloadComfyUIOutputs 复用同一套下载与归类规则，只换掉失败文案的来源标识。
+func (c *Client) DownloadComfyUIOutputs(ctx context.Context, urls []string, taskID string, policy *PollPolicy) (map[string]interface{}, error) {
+	return c.downloadOutputs(ctx, urls, taskID, policy, "ComfyUI")
+}
+
+// downloadOutputs 下载产物并按 MIME 归类。providerLabel 只用于错误文案，让本地
+// ComfyUI 与云端 RunningHub 的失败信息能区分来源。
+func (c *Client) downloadOutputs(ctx context.Context, urls []string, taskID string, policy *PollPolicy, providerLabel string) (map[string]interface{}, error) {
 	c = c.prepared()
 	images := make([]map[string]interface{}, 0)
 	var video, audio map[string]interface{}
@@ -445,7 +464,7 @@ func (c *Client) DownloadOutputs(ctx context.Context, urls []string, taskID stri
 			data, mimeType, err = c.Poller.Download(ctx, taskID, *policy, download)
 		}
 		if err != nil {
-			return nil, fmt.Errorf("下载 RunningHub 产物失败：%w", err)
+			return nil, fmt.Errorf("下载 %s 产物失败：%w", providerLabel, err)
 		}
 		mimeType = runningHubOutputMimeType(rawURL, mimeType)
 		item := workflowOutputValue(mimeType, data)
@@ -475,7 +494,7 @@ func (c *Client) DownloadOutputs(ctx context.Context, urls []string, taskID stri
 		result["audio"] = audio
 	}
 	if len(images) == 0 && video == nil && audio == nil {
-		return nil, errors.New("RunningHub 返回的产物类型不受支持")
+		return nil, errf("%s 返回的产物类型不受支持", providerLabel)
 	}
 	return result, nil
 }

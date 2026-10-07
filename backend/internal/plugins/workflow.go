@@ -8,12 +8,32 @@ import (
 
 func BundledWorkflowManifests() []protocol.Manifest {
 	return []protocol.Manifest{
-		workflowPluginManifest(WorkflowRunningHub, "RunningHub 工作流", "在画布中拉取并执行 RunningHub Workflow 与 App。"),
+		workflowPluginManifest(WorkflowRunningHub, "RunningHub 工作流", "在画布中拉取并执行 RunningHub Workflow 与 App。",
+			[]protocol.Capability{protocol.CapabilityImage, protocol.CapabilityVideo, protocol.CapabilityAudio}),
+		workflowPluginManifest(WorkflowComfyUI, "ComfyUI 工作流", "连接本地或可信网络内的原生 ComfyUI，按工作流字段生成图片和视频。",
+			[]protocol.Capability{protocol.CapabilityImage, protocol.CapabilityVideo}),
 	}
 }
 
-func workflowPluginManifest(id, name, description string) protocol.Manifest {
-	capabilities := []protocol.Capability{protocol.CapabilityImage, protocol.CapabilityVideo, protocol.CapabilityAudio}
+// bundledWorkflowPluginIDs 是所有「执行落在宿主 Go 代码、生命周期交给插件运行时」的
+// 工作流能力。顺序同时决定插件列表与状态返回顺序。
+func BundledWorkflowPluginIDs() []string {
+	return []string{WorkflowRunningHub, WorkflowComfyUI}
+}
+
+// WorkflowDisplayName 用于插件门禁失败时的可读提示。
+func WorkflowDisplayName(pluginID string) string {
+	switch pluginID {
+	case WorkflowRunningHub:
+		return "RunningHub 工作流插件"
+	case WorkflowComfyUI:
+		return "ComfyUI 工作流插件"
+	default:
+		return "工作流插件"
+	}
+}
+
+func workflowPluginManifest(id, name, description string, capabilities []protocol.Capability) protocol.Manifest {
 	workflows := make([]protocol.ManifestWorkflow, 0, len(capabilities))
 	for _, capability := range capabilities {
 		workflows = append(workflows, protocol.ManifestWorkflow{
@@ -47,6 +67,8 @@ func WorkflowIDForInterface(value string) (string, bool) {
 	switch strings.ToLower(strings.TrimSpace(value)) {
 	case "runninghub-workflow-image", "runninghub-workflow-video", "runninghub-workflow-audio":
 		return WorkflowRunningHub, true
+	case "comfyui-workflow-image", "comfyui-workflow-video":
+		return WorkflowComfyUI, true
 	default:
 		return "", false
 	}

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"infinite-canvas/backend/internal/model"
+	"infinite-canvas/backend/internal/provider/workflow"
 	"infinite-canvas/backend/internal/repository"
 )
 
@@ -176,7 +177,9 @@ func (s *Service) providerCancellationInput(task *model.Task) (canvasGenerationI
 }
 
 func supportsProviderCancellation(interfaceType string) bool {
-	return interfaceType == string(model.ChannelInterfaceGeminiVeo) || model.IsVolcengineArkVideoProtocol(model.ChannelInterfaceType(interfaceType))
+	return interfaceType == string(model.ChannelInterfaceGeminiVeo) ||
+		model.IsVolcengineArkVideoProtocol(model.ChannelInterfaceType(interfaceType)) ||
+		isComfyUIInterface(interfaceType)
 }
 
 func cancelProviderTask(ctx context.Context, config providerConfig, providerRequestID string) error {
@@ -187,9 +190,28 @@ func cancelProviderTask(ctx context.Context, config providerConfig, providerRequ
 	case model.IsVolcengineArkVideoProtocol(model.ChannelInterfaceType(config.InterfaceType)):
 		path := "/contents/generations/tasks/" + url.PathEscape(providerRequestID)
 		return deleteProviderTask(ctx, config, path)
+	case isComfyUIInterface(config.InterfaceType):
+		return cancelComfyUITask(ctx, config, providerRequestID)
 	default:
 		return errors.New("当前上游协议不支持取消")
 	}
+}
+
+// comfyUIWorkflowClient 只用到出站执行端口：ComfyUI 的取消与对账不落本地回执。
+func comfyUIWorkflowClient() *workflow.Client {
+	return &workflow.Client{Requests: workflowRequestExecutor{}}
+}
+
+func cancelComfyUITask(ctx context.Context, config providerConfig, promptID string) error {
+	return comfyUIWorkflowClient().CancelComfyUI(ctx, workflowConfigFromProvider(config), promptID)
+}
+
+func queryComfyUICancellation(ctx context.Context, config providerConfig, promptID string) (providerCancellationOutcome, string, error) {
+	result, err := comfyUIWorkflowClient().QueryComfyUICancellation(ctx, workflowConfigFromProvider(config), promptID)
+	if err != nil {
+		return "", "", err
+	}
+	return providerCancellationOutcome(result.Outcome), result.Status, nil
 }
 
 func deleteProviderTask(ctx context.Context, config providerConfig, path string) error {
@@ -251,6 +273,8 @@ func queryProviderCancellation(ctx context.Context, config providerConfig, provi
 		default:
 			return providerCancellationPending, firstNonEmpty(status, "unknown"), nil
 		}
+	case isComfyUIInterface(config.InterfaceType):
+		return queryComfyUICancellation(ctx, config, providerRequestID)
 	default:
 		return "", "", errors.New("当前上游协议不支持取消状态查询")
 	}

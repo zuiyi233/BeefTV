@@ -7,6 +7,10 @@ var officialApplicationPolicies = map[string]ManagementView{
 		Origin: OriginOfficial, Kind: KindApplication,
 		ActivationScope: ScopeUser, ConfigurationScope: ConfigurationUser,
 	},
+	WorkflowComfyUI: {
+		Origin: OriginOfficial, Kind: KindApplication,
+		ActivationScope: ScopeUser, ConfigurationScope: ConfigurationUser,
+	},
 	EagleAssetConnector: {
 		Origin: OriginOfficial, Kind: KindApplication,
 		ActivationScope: ScopeUser, ConfigurationScope: ConfigurationUser,

@@ -6,6 +6,7 @@ import (
 
 const (
 	WorkflowPluginRunningHub = plugins.WorkflowRunningHub
+	WorkflowPluginComfyUI    = plugins.WorkflowComfyUI
 )
 
 func workflowPluginIDForInterface(value string) (string, bool) {

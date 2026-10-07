@@ -297,6 +297,19 @@ func IsWorkflowInterfaceType(value string) bool {
 	switch strings.ToLower(strings.TrimSpace(value)) {
 	case string(model.ChannelInterfaceRunningHubImage), string(model.ChannelInterfaceRunningHubVideo), string(model.ChannelInterfaceRunningHubAudio):
 		return true
+	case string(model.ChannelInterfaceComfyUIImage), string(model.ChannelInterfaceComfyUIVideo):
+		return true
+	default:
+		return false
+	}
+}
+
+// isComfyUIWorkflowInterfaceType 区分原生 ComfyUI 与云端 RunningHub 的可执行条件：
+// 前者是自托管服务，默认部署不配置鉴权。
+func isComfyUIWorkflowInterfaceType(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case string(model.ChannelInterfaceComfyUIImage), string(model.ChannelInterfaceComfyUIVideo):
+		return true
 	default:
 		return false
 	}
@@ -309,6 +322,11 @@ func HasExecutableVideoConfig(input map[string]any) bool {
 		return false
 	}
 	interfaceType := admissionString(config["interfaceType"])
+	if isComfyUIWorkflowInterfaceType(interfaceType) {
+		// ComfyUI 没有鉴权，因此不要求 API Key；地址与工作流 JSON 都存在才算可执行。
+		workflowJSON, _ := config["workflowJson"].(map[string]any)
+		return admissionString(config["baseUrl"]) != "" && len(workflowJSON) > 0
+	}
 	if IsWorkflowInterfaceType(interfaceType) {
 		if admissionString(config["workflowId"]) == "" && admissionString(config["webappId"]) == "" && admissionString(config["model"]) == "" {
 			return false

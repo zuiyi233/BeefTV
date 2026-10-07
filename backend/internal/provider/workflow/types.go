@@ -84,11 +84,15 @@ func IsRunningHubInterface(value string) bool {
 
 // IsProviderInterface reports whether the interface is a workflow provider.
 func IsProviderInterface(value string) bool {
-	return IsRunningHubInterface(value)
+	return IsRunningHubInterface(value) || IsComfyUIInterface(value)
 }
 
 func isRunningHubInterface(value string) bool {
 	return IsRunningHubInterface(value)
+}
+
+func isComfyUIInterface(value string) bool {
+	return IsComfyUIInterface(value)
 }
 
 func isWorkflowProviderInterface(value string) bool {
@@ -98,9 +102,11 @@ func isWorkflowProviderInterface(value string) bool {
 func workflowInterfaceSupportsMode(interfaceType string, mode string) bool {
 	switch mode {
 	case "image":
-		return interfaceType == string(model.ChannelInterfaceRunningHubImage)
+		return interfaceType == string(model.ChannelInterfaceRunningHubImage) ||
+			interfaceType == string(model.ChannelInterfaceComfyUIImage)
 	case "video":
-		return interfaceType == string(model.ChannelInterfaceRunningHubVideo)
+		return interfaceType == string(model.ChannelInterfaceRunningHubVideo) ||
+			interfaceType == string(model.ChannelInterfaceComfyUIVideo)
 	case "audio":
 		return interfaceType == string(model.ChannelInterfaceRunningHubAudio)
 	default:
@@ -126,6 +132,17 @@ func ValidateConfig(mode string, config Config) error {
 		}
 		if strings.TrimSpace(config.WorkflowID) == "" && strings.TrimSpace(config.WebappID) == "" && strings.TrimSpace(config.Model) == "" {
 			return errText("RunningHub 缺少 workflowId 或 webappId")
+		}
+		return nil
+	}
+	if isComfyUIInterface(config.InterfaceType) {
+		// ComfyUI 是本地或可信网络内的自托管服务，默认部署不配置鉴权，因此不像
+		// RunningHub 那样强制要求 API Key；只校验出站地址与工作流声明。
+		if _, err := outbound.ValidateOutboundURL(comfyUIRootURL(config.BaseURL)); err != nil {
+			return err
+		}
+		if len(config.WorkflowJSON) == 0 {
+			return errText("ComfyUI 缺少工作流 JSON")
 		}
 		return nil
 	}

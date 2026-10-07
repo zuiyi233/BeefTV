@@ -15,6 +15,8 @@ import (
 
 	"infinite-canvas/backend/internal/model"
 
+	"infinite-canvas/backend/internal/provider/workflow"
+
 	"gorm.io/gorm"
 )
 
@@ -438,6 +440,9 @@ func (s *Service) resolveProviderConfig(config providerConfig) (providerConfig, 
 	}
 	if isRunningHubInterface(config.InterfaceType) && strings.TrimSpace(config.BaseURL) == "" {
 		config.BaseURL = "https://www.runninghub.cn"
+	}
+	if isComfyUIInterface(config.InterfaceType) && strings.TrimSpace(config.BaseURL) == "" {
+		config.BaseURL = workflow.DefaultComfyUIRootURL
 	}
 	channelID := strings.TrimSpace(config.ChannelID)
 	if channelID == "" {

@@ -12,13 +12,21 @@ import (
 // RunningHubWorkflowFetchRequest 只用于独立工作流设置页，不进入 ModelChannel。
 type RunningHubWorkflowFetchRequest = workflow.FetchRequest
 
+// ComfyUIObjectInfoRequest 只用于工作流字段映射设置页的节点定义代理。
+type ComfyUIObjectInfoRequest = workflow.ComfyUIObjectInfoRequest
+
 func isRunningHubInterface(value string) bool {
 	pluginID, ok := workflowPluginIDForInterface(value)
 	return ok && pluginID == WorkflowPluginRunningHub
 }
 
+func isComfyUIInterface(value string) bool {
+	pluginID, ok := workflowPluginIDForInterface(value)
+	return ok && pluginID == WorkflowPluginComfyUI
+}
+
 func isWorkflowProviderInterface(value string) bool {
-	return isRunningHubInterface(value)
+	return workflow.IsProviderInterface(value)
 }
 
 func validateWorkflowProviderConfig(mode string, config providerConfig) error {
@@ -26,8 +34,11 @@ func validateWorkflowProviderConfig(mode string, config providerConfig) error {
 }
 
 func (s *Service) runWorkflowProviderTask(ctx context.Context, input canvasGenerationInput) (map[string]interface{}, error) {
-	if isRunningHubInterface(input.Config.InterfaceType) {
+	switch {
+	case isRunningHubInterface(input.Config.InterfaceType):
 		return s.runRunningHubWorkflow(ctx, input)
+	case isComfyUIInterface(input.Config.InterfaceType):
+		return s.runComfyUIWorkflow(ctx, input)
 	}
 	return nil, errors.New("未知工作流协议")
 }
@@ -58,6 +69,17 @@ func (s *Service) runRunningHubWorkflow(ctx context.Context, input canvasGenerat
 		return nil, s.fenceWorkflowSubmission(ctx, converted, err)
 	}
 	return result, nil
+}
+
+// runComfyUIWorkflow 提交或恢复原生 ComfyUI 工作流。插件门禁在这里不重复校验：
+// generation.executeWorkflow 派发前已经要求对应工作流插件启用。
+func (s *Service) runComfyUIWorkflow(ctx context.Context, input canvasGenerationInput) (map[string]interface{}, error) {
+	return s.workflowClient(nil).RunComfyUI(ctx, s.workflowInputFromCanvas(ctx, input))
+}
+
+// FetchComfyUIObjectInfo 代理读取并裁剪 ComfyUI 的节点定义，浏览器不直接访问上游。
+func (s *Service) FetchComfyUIObjectInfo(ctx context.Context, request ComfyUIObjectInfoRequest) (map[string]any, error) {
+	return s.workflowClient(nil).FetchComfyUIObjectInfo(ctx, request)
 }
 
 // fenceWorkflowSubmission maps domain create-path uncertainty onto the current

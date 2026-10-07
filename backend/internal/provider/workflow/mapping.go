@@ -405,17 +405,24 @@ func resolveWorkflowFieldValue(field Field, files map[string]string, input Input
 	}
 	if field.RandomEnabled {
 		randomMax := field.Max
-		if isRunningHubInterface(input.Config.InterfaceType) && isWorkflowSeedField(field.FieldName) {
-			// RunningHub 的随机 Seed 按 uint32 传输，不能沿用 JavaScript 安全整数上限。
-			const runningHubSeedMax int64 = 1<<32 - 1
-			maxValue, err := workflowIntegerBound(field.Max, runningHubSeedMax)
-			if err != nil {
-				return nil, false, err
+		if isWorkflowSeedField(field.FieldName) {
+			switch {
+			case isRunningHubInterface(input.Config.InterfaceType):
+				// RunningHub 的随机 Seed 按 uint32 传输，不能沿用 JavaScript 安全整数上限。
+				const runningHubSeedMax int64 = 1<<32 - 1
+				maxValue, err := workflowIntegerBound(field.Max, runningHubSeedMax)
+				if err != nil {
+					return nil, false, err
+				}
+				if maxValue > runningHubSeedMax {
+					maxValue = runningHubSeedMax
+				}
+				randomMax = maxValue
+			case isComfyUIInterface(input.Config.InterfaceType):
+				// ComfyUI 把 seed 声明到 uint64 上限（18446744073709551615），既超出
+				// ParseInt 也超出 JavaScript 安全整数范围，改用安全整数上限。
+				randomMax = comfyUISeedRandomMax
 			}
-			if maxValue > runningHubSeedMax {
-				maxValue = runningHubSeedMax
-			}
-			randomMax = maxValue
 		}
 		value, err := randomWorkflowInteger(field.Min, randomMax)
 		return value, err == nil, err
