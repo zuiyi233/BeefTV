@@ -143,6 +143,56 @@ func TestResolveChatGPTSubscriptionCredentialInjectsAccessToken(t *testing.T) {
 	}
 }
 
+// TestResolveChatGPTSubscriptionPinsBaseURL 锁住订阅令牌的目的地：短期 access_token 只
+// 允许发往 Codex 后端，渠道配置里的基址一律作废；非订阅渠道的基址不能被顺手改写。
+func TestResolveChatGPTSubscriptionPinsBaseURL(t *testing.T) {
+	server := newStubAuthServer(t)
+	auth, err := chatgptauth.New(chatgptauth.Options{DataDir: t.TempDir(), Issuer: server.URL, ClientID: "client-test"})
+	if err != nil {
+		t.Fatalf("new auth service: %v", err)
+	}
+	t.Cleanup(func() { _ = auth.Close() })
+
+	ctx := context.Background()
+	if _, err := auth.Start(ctx, "user-1"); err != nil {
+		t.Fatalf("start login: %v", err)
+	}
+	waitForAuthState(t, auth, "user-1", chatgptauth.StateConnected)
+	service := &Service{chatGPTAuth: auth}
+
+	config := providerConfig{
+		CredentialRef: chatgptauth.CredentialRef,
+		InterfaceType: "chatgpt-subscription",
+		BaseURL:       "https://attacker.example/latest",
+	}
+	if err := service.resolveChatGPTSubscriptionCredential(ctx, "user-1", &config); err != nil {
+		t.Fatalf("resolve credential: %v", err)
+	}
+	if config.APIKey == "" {
+		t.Fatal("access token must still be injected")
+	}
+	if config.BaseURL != chatgptauth.CodexBaseURL {
+		t.Fatalf("subscription base url must be pinned to %q, got %q", chatgptauth.CodexBaseURL, config.BaseURL)
+	}
+
+	// 模型目录请求同样带着短期令牌，基址也必须在执行期钉死。
+	models := ChannelModelsRequest{CredentialRef: chatgptauth.CredentialRef, BaseURL: "https://attacker.example/v1"}
+	if err := service.resolveChatGPTModelsCredential(ctx, "user-1", &models); err != nil {
+		t.Fatalf("resolve models credential: %v", err)
+	}
+	if models.BaseURL != chatgptauth.CodexBaseURL {
+		t.Fatalf("models request base url must be pinned, got %q", models.BaseURL)
+	}
+
+	plain := providerConfig{APIKey: "sk-plain", BaseURL: "https://api.example.com/v1"}
+	if err := service.resolveChatGPTSubscriptionCredential(ctx, "user-1", &plain); err != nil {
+		t.Fatalf("plain channel must be skipped: %v", err)
+	}
+	if plain.BaseURL != "https://api.example.com/v1" || plain.APIKey != "sk-plain" {
+		t.Fatal("plain channel config must not be rewritten")
+	}
+}
+
 func newStubAuth(t *testing.T) *chatgptauth.Service {
 	t.Helper()
 	auth, err := chatgptauth.New(chatgptauth.Options{DataDir: t.TempDir(), Issuer: newStubAuthServer(t).URL, ClientID: "client-test"})

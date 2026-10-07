@@ -59,6 +59,9 @@ func (s *Service) resolveChatGPTSubscriptionCredential(ctx context.Context, user
 	config.APIKey = credential.AccessToken
 	config.ChatGPTAccountID = credential.AccountID
 	config.ChatGPTFedRAMP = credential.FedRAMP
+	// 渠道里写什么基址都不作数：订阅访问令牌只允许发往 Codex 后端本身。
+	// BeefAPI 那类托管渠道可以按配置回落基址，这里不行——令牌一旦出境就是账号级凭据泄露。
+	config.BaseURL = chatgptauth.CodexBaseURL
 	return nil
 }
 
@@ -82,8 +85,7 @@ func (s *Service) resolveChatGPTModelsCredential(ctx context.Context, userID str
 	input.ChatGPTAccountID = credential.AccountID
 	input.ChatGPTFedRAMP = credential.FedRAMP
 	input.APIFormat = "openai"
-	if strings.TrimSpace(input.BaseURL) == "" {
-		input.BaseURL = chatgptauth.CodexBaseURL
-	}
+	// 与生成任务同一约束：目录请求带着短期令牌，基址必须由后端钉死而不是取渠道配置。
+	input.BaseURL = chatgptauth.CodexBaseURL
 	return nil
 }
