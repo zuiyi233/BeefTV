@@ -182,7 +182,7 @@ func (s *Service) providerCancellationInput(task *model.Task) (canvasGenerationI
 }
 
 // supportsProviderCancellation 先认宿主已实现的厂商取消，再认插件声明：
-// 只有当前 ctx 能解析出声明式适配器、manifest 声明了 cancel 操作，并且 BuildCancel
+// 只有当前 ctx 能解析出声明式适配器、manifest 声明了 cancel 操作，并且取消请求
 // 针对这条真实上游任务产出可执行 RequestSpec 时，才判定该接口可取消。
 // 判定失败必须保持显式不支持，不能退化成静默空操作。
 func supportsProviderCancellation(ctx context.Context, config providerConfig, providerRequestID string) bool {
@@ -191,22 +191,36 @@ func supportsProviderCancellation(ctx context.Context, config providerConfig, pr
 		isComfyUIInterface(config.InterfaceType) {
 		return true
 	}
-	_, ok := declarativeCancelSpec(ctx, config, providerRequestID)
+	_, ok := declarativeCancelRequests(ctx, config, providerRequestID)
 	return ok
 }
 
-// declarativeCancelSpec 读取插件声明的 cancel 操作。manifest 只描述 method/path/body，
-// 凭证注入、SSRF 校验、超时和回执仍由 executeProtocolRequest 的宿主出站边界统一执行。
-func declarativeCancelSpec(ctx context.Context, config providerConfig, providerRequestID string) (protocol.RequestSpec, bool) {
+// declarativeCancelRequests 读取插件声明的取消请求：manifest 的 cancel 主操作，加上
+// cancelOperations 声明的补发操作，顺序即执行顺序。凭证注入、SSRF 校验、超时和回执
+// 仍由 executeProtocolRequest 的宿主出站边界统一执行。
+func declarativeCancelRequests(ctx context.Context, config providerConfig, providerRequestID string) ([]protocol.RequestSpec, bool) {
 	adapter, ok := declarativeProtocolAdapterForContext(ctx, config.InterfaceType)
 	if !ok || strings.TrimSpace(adapter.Metadata().Cancel) == "" {
-		return protocol.RequestSpec{}, false
+		return nil, false
 	}
-	spec, err := adapter.BuildCancel(ctx, declarativeCancellationPollContext(config, providerRequestID))
+	pollContext := declarativeCancellationPollContext(config, providerRequestID)
+	if multi, ok := adapter.(protocol.CancelRequestsAdapter); ok {
+		specs, err := multi.BuildCancelRequests(ctx, pollContext)
+		if err != nil || len(specs) == 0 {
+			return nil, false
+		}
+		for _, spec := range specs {
+			if spec.Validate() != nil {
+				return nil, false
+			}
+		}
+		return specs, true
+	}
+	spec, err := adapter.BuildCancel(ctx, pollContext)
 	if err != nil || spec.Validate() != nil {
-		return protocol.RequestSpec{}, false
+		return nil, false
 	}
-	return spec, true
+	return []protocol.RequestSpec{spec}, true
 }
 
 // 声明式取消只依赖任务身份：已安装插件的 cancel 操作都以 {{taskId}} 定位上游任务，
@@ -231,12 +245,18 @@ func cancelProviderTask(ctx context.Context, config providerConfig, providerRequ
 	case isComfyUIInterface(config.InterfaceType):
 		return cancelComfyUITask(ctx, config, providerRequestID)
 	default:
-		spec, ok := declarativeCancelSpec(ctx, config, providerRequestID)
+		specs, ok := declarativeCancelRequests(ctx, config, providerRequestID)
 		if !ok {
 			return errors.New("当前上游协议不支持取消")
 		}
-		_, err := executeProtocolRequest(bindRequestReceipts(ctx), config, spec)
-		return err
+		// 按声明顺序发，任一失败即返回：与宿主自带的 ComfyUI 取消一致，后续请求可能
+		// 依赖前一步已生效，不能为了"尽量多发"而吞掉失败。
+		for _, spec := range specs {
+			if _, err := executeProtocolRequest(bindRequestReceipts(ctx), config, spec); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 }
 

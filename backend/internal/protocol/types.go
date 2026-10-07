@@ -200,15 +200,16 @@ type Manifest struct {
 	// These fields are the normalized provider projection used by the runtime.
 	// They are never serialized; provider execution is described only under
 	// contributes.providers.
-	Create          ManifestOperation      `json:"-"`
-	Agent           *ManifestOperation     `json:"-"`
-	Poll            *ManifestOperation     `json:"-"`
-	Cancel          *ManifestOperation     `json:"-"`
-	ResultOperation *ManifestOperation     `json:"-"`
-	Response        ManifestResponse       `json:"-"`
-	AgentResponse   *ManifestAgentResponse `json:"-"`
-	Auth            ManifestAuth           `json:"-"`
-	Validations     []ManifestValidation   `json:"-"`
+	Create           ManifestOperation      `json:"-"`
+	Agent            *ManifestOperation     `json:"-"`
+	Poll             *ManifestOperation     `json:"-"`
+	Cancel           *ManifestOperation     `json:"-"`
+	CancelOperations []*ManifestOperation   `json:"-"`
+	ResultOperation  *ManifestOperation     `json:"-"`
+	Response         ManifestResponse       `json:"-"`
+	AgentResponse    *ManifestAgentResponse `json:"-"`
+	Auth             ManifestAuth           `json:"-"`
+	Validations      []ManifestValidation   `json:"-"`
 }
 
 // Manifest JSON is the public plugin contract. Metadata is an internal
@@ -300,22 +301,26 @@ type ManifestContributions struct {
 }
 
 type ManifestProvider struct {
-	ID                      string                 `json:"id"`
-	Label                   string                 `json:"label"`
-	Capabilities            []Capability           `json:"capabilities"`
-	Scopes                  []Surface              `json:"scopes"`
-	BaseURL                 string                 `json:"baseUrl,omitempty"`
-	RequiresPublicMediaURLs bool                   `json:"requiresPublicMediaUrls,omitempty"`
-	Auth                    ManifestAuth           `json:"auth,omitempty"`
-	Parameters              []Parameter            `json:"parameters,omitempty"`
-	Validations             []ManifestValidation   `json:"validations,omitempty"`
-	Create                  ManifestOperation      `json:"create"`
-	Agent                   *ManifestOperation     `json:"agent,omitempty"`
-	Poll                    *ManifestOperation     `json:"poll,omitempty"`
-	Cancel                  *ManifestOperation     `json:"cancel,omitempty"`
-	Result                  *ManifestOperation     `json:"result,omitempty"`
-	Response                ManifestResponse       `json:"response"`
-	AgentResponse           *ManifestAgentResponse `json:"agentResponse,omitempty"`
+	ID                      string               `json:"id"`
+	Label                   string               `json:"label"`
+	Capabilities            []Capability         `json:"capabilities"`
+	Scopes                  []Surface            `json:"scopes"`
+	BaseURL                 string               `json:"baseUrl,omitempty"`
+	RequiresPublicMediaURLs bool                 `json:"requiresPublicMediaUrls,omitempty"`
+	Auth                    ManifestAuth         `json:"auth,omitempty"`
+	Parameters              []Parameter          `json:"parameters,omitempty"`
+	Validations             []ManifestValidation `json:"validations,omitempty"`
+	Create                  ManifestOperation    `json:"create"`
+	Agent                   *ManifestOperation   `json:"agent,omitempty"`
+	Poll                    *ManifestOperation   `json:"poll,omitempty"`
+	Cancel                  *ManifestOperation   `json:"cancel,omitempty"`
+	// CancelOperations 是 cancel 之后按序补发的取消请求。有些上游一次调用只覆盖
+	// 一种状态：ComfyUI 的 /queue delete 只摘掉排队项，执行中的任务还要 /interrupt。
+	// 两段都发是安全的，已结束的任务不会因此报错。
+	CancelOperations []*ManifestOperation   `json:"cancelOperations,omitempty"`
+	Result           *ManifestOperation     `json:"result,omitempty"`
+	Response         ManifestResponse       `json:"response"`
+	AgentResponse    *ManifestAgentResponse `json:"agentResponse,omitempty"`
 }
 
 type ManifestAuth struct {

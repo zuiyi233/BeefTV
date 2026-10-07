@@ -71,7 +71,7 @@ func TestVolcengineArkProviderCancellationUsesDelete(t *testing.T) {
 
 // declarativeCancellationTestContext 注入一个只描述 protocol 的上传型插件，
 // 用于验证宿主确实按 manifest 声明驱动取消，而不是依赖厂商白名单。
-func declarativeCancellationTestContext(t *testing.T, providerID string, withPoll bool, withCancel bool) context.Context {
+func declarativeCancellationTestContext(t *testing.T, providerID string, withPoll bool, withCancel bool, withCancelFollowUp bool) context.Context {
 	t.Helper()
 	operations := `"create":{"method":"POST","path":"/v1/tasks","fields":{"model":"request.model"}}`
 	if withPoll {
@@ -79,6 +79,10 @@ func declarativeCancellationTestContext(t *testing.T, providerID string, withPol
 	}
 	if withCancel {
 		operations += `,"cancel":{"method":"POST","path":"/v1/tasks/{{taskId}}/cancel","fields":{"reason":"host-review"}}`
+	}
+	if withCancelFollowUp {
+		// 一次调用覆盖不全的协议：cancel 只摘排队项，补发的 interrupt 才中断执行中的任务。
+		operations += `,"cancelOperations":[{"method":"POST","path":"/v1/interrupt","fields":{"prompt_id":"taskId"}}]`
 	}
 	manifest := fmt.Sprintf(`{"apiVersion":"beeftv.plugin/v1","id":%q,"version":"1.0.0","name":"Declarative Cancel Test","author":"Test",`+
 		`"contributes":{"providers":[{"id":%q,"label":"Declarative Cancel Test","capabilities":["video"],"scopes":["canvas"],`+
@@ -120,7 +124,7 @@ func TestDeclarativeProviderCancellationIssuesManifestCancelRequest(t *testing.T
 	}))
 	defer server.Close()
 
-	ctx := declarativeCancellationTestContext(t, "declarative-cancel", true, true)
+	ctx := declarativeCancellationTestContext(t, "declarative-cancel", true, true, false)
 	config := providerConfig{InterfaceType: "declarative-cancel", BaseURL: server.URL, APIKey: "test-key", Model: "test-model"}
 	if !supportsProviderCancellation(ctx, config, "task-9") {
 		t.Fatal("声明了 cancel 操作的插件应判定为可取消")
@@ -146,6 +150,48 @@ func TestDeclarativeProviderCancellationIssuesManifestCancelRequest(t *testing.T
 	}
 }
 
+// 只声明一个 cancel 的协议保持单发，声明了 cancelOperations 的协议必须按顺序补发，
+// 并且每个请求都各自过宿主的凭证注入与出站边界。
+func TestDeclarativeProviderCancellationIssuesFollowUpRequests(t *testing.T) {
+	allowLoopbackProviderTest(t)
+	var order []string
+	var interruptBody string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/tasks/task-9/cancel":
+			order = append(order, "cancel")
+			_, _ = w.Write([]byte(`{"id":"task-9","status":"cancelled"}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/interrupt":
+			order = append(order, "interrupt")
+			if r.Header.Get("Authorization") != "Bearer test-key" {
+				t.Errorf("补发请求的凭证必须由宿主注入：%q", r.Header.Get("Authorization"))
+			}
+			body, _ := io.ReadAll(r.Body)
+			interruptBody = string(body)
+			_, _ = w.Write([]byte(`{"interrupted":true}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	ctx := declarativeCancellationTestContext(t, "declarative-cancel-multi", false, true, true)
+	config := providerConfig{InterfaceType: "declarative-cancel-multi", BaseURL: server.URL, APIKey: "test-key", Model: "test-model"}
+	if !supportsProviderCancellation(ctx, config, "task-9") {
+		t.Fatal("带 cancelOperations 的插件应判定为可取消")
+	}
+	if err := cancelProviderTask(ctx, config, "task-9"); err != nil {
+		t.Fatal(err)
+	}
+	if len(order) != 2 || order[0] != "cancel" || order[1] != "interrupt" {
+		t.Fatalf("取消请求必须按声明顺序发完：%#v", order)
+	}
+	if !strings.Contains(interruptBody, `"prompt_id":"task-9"`) {
+		t.Fatalf("补发请求体应由 manifest 声明决定：%q", interruptBody)
+	}
+}
+
 // 未声明 cancel 的插件必须保持显式失败，不能变成静默空操作；声明了 cancel 但上游
 // 返回非 2xx 时，错误要保持既有 providerHTTPError 形状；只有 cancel 没有状态查询时，
 // 对账必须停在 pending/unknown，不能伪造供应商确认。
@@ -163,7 +209,7 @@ func TestDeclarativeProviderCancellationFailuresStayExplicit(t *testing.T) {
 	}))
 	defer server.Close()
 
-	undeclaredCtx := declarativeCancellationTestContext(t, "declarative-no-cancel", true, false)
+	undeclaredCtx := declarativeCancellationTestContext(t, "declarative-no-cancel", true, false, false)
 	undeclaredConfig := providerConfig{InterfaceType: "declarative-no-cancel", BaseURL: server.URL, APIKey: "test-key", Model: "test-model"}
 	if supportsProviderCancellation(undeclaredCtx, undeclaredConfig, "task-9") {
 		t.Fatal("未声明 cancel 的插件不能判为可取消")
@@ -176,7 +222,7 @@ func TestDeclarativeProviderCancellationFailuresStayExplicit(t *testing.T) {
 		t.Fatalf("不支持取消的协议不能发出取消请求：requests=%d", cancelRequests)
 	}
 
-	declaredCtx := declarativeCancellationTestContext(t, "declarative-cancel", true, true)
+	declaredCtx := declarativeCancellationTestContext(t, "declarative-cancel", true, true, false)
 	declaredConfig := providerConfig{InterfaceType: "declarative-cancel", BaseURL: server.URL, APIKey: "test-key", Model: "test-model"}
 	if err := cancelProviderTask(declaredCtx, declaredConfig, "task-9"); err == nil {
 		t.Fatal("上游非 2xx 必须失败")
@@ -194,7 +240,7 @@ func TestDeclarativeProviderCancellationFailuresStayExplicit(t *testing.T) {
 		http.NotFound(w, r)
 	}))
 	defer queryServer.Close()
-	cancelOnlyCtx := declarativeCancellationTestContext(t, "declarative-cancel-only", false, true)
+	cancelOnlyCtx := declarativeCancellationTestContext(t, "declarative-cancel-only", false, true, false)
 	outcome, status, err := queryProviderCancellation(cancelOnlyCtx, providerConfig{InterfaceType: "declarative-cancel-only", BaseURL: queryServer.URL, APIKey: "test-key"}, "task-9")
 	if err != nil {
 		t.Fatal(err)

@@ -39,6 +39,15 @@ type ResultCapability interface {
 	ResultAvailable() bool
 }
 
+// CancelRequestsAdapter is the optional protocol surface for providers where a
+// single upstream call cannot cover every task state, such as a queue that only
+// removes pending work and a separate endpoint that interrupts running work.
+// Requests run in the returned order; credentials, outbound policy and receipts
+// stay with the host.
+type CancelRequestsAdapter interface {
+	BuildCancelRequests(context.Context, PollContext) ([]RequestSpec, error)
+}
+
 type AgentRequestContext struct {
 	BaseURL string
 	Model   string

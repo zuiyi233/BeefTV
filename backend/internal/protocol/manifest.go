@@ -185,6 +185,18 @@ func (a metadataAdapter) ParsePoll(ctx context.Context, c PollContext, body []by
 func (a metadataAdapter) BuildCancel(ctx context.Context, c PollContext) (RequestSpec, error) {
 	return a.delegate.BuildCancel(ctx, c)
 }
+
+func (a metadataAdapter) BuildCancelRequests(ctx context.Context, c PollContext) ([]RequestSpec, error) {
+	adapter, ok := a.delegate.(CancelRequestsAdapter)
+	if !ok {
+		spec, err := a.delegate.BuildCancel(ctx, c)
+		if err != nil {
+			return nil, err
+		}
+		return []RequestSpec{spec}, nil
+	}
+	return adapter.BuildCancelRequests(ctx, c)
+}
 func (a metadataAdapter) BuildResult(ctx context.Context, c PollContext) (RequestSpec, error) {
 	adapter, ok := a.delegate.(ResultAdapter)
 	if !ok {
@@ -312,6 +324,17 @@ func ValidateManifest(manifest Manifest) error {
 				return fmt.Errorf("provider %q cancel operation: %w", provider.ID, err)
 			}
 		}
+		if len(provider.CancelOperations) > 0 && provider.Cancel == nil {
+			return fmt.Errorf("provider %q cancelOperations requires a cancel operation", provider.ID)
+		}
+		for index, operation := range provider.CancelOperations {
+			if operation == nil {
+				return fmt.Errorf("provider %q cancel operation %d is missing", provider.ID, index)
+			}
+			if err := validateManifestOperation(*operation); err != nil {
+				return fmt.Errorf("provider %q cancel operation %d: %w", provider.ID, index, err)
+			}
+		}
 		if provider.Result != nil {
 			if err := validateManifestOperation(*provider.Result); err != nil {
 				return fmt.Errorf("provider %q result operation: %w", provider.ID, err)
@@ -361,6 +384,7 @@ func normalizeManifestForProvider(manifest *Manifest, index int) error {
 	manifest.Agent = provider.Agent
 	manifest.Poll = provider.Poll
 	manifest.Cancel = provider.Cancel
+	manifest.CancelOperations = provider.CancelOperations
 	manifest.ResultOperation = provider.Result
 	manifest.Response = provider.Response
 	manifest.AgentResponse = provider.AgentResponse
@@ -565,6 +589,34 @@ func (a manifestAdapter) BuildCancel(_ context.Context, c PollContext) (RequestS
 	return buildManifestOperation(*a.manifest.Cancel, a.manifest.Auth, request, c.TaskID)
 }
 
+// BuildCancelRequests 按声明顺序返回 cancel 与其补发请求。取消要覆盖排队与执行两种
+// 状态的协议（例如 ComfyUI 的 /queue delete 加 /interrupt）靠这一个端口表达，
+// 凭证注入、SSRF 校验与出站边界仍由宿主执行。
+func (a manifestAdapter) BuildCancelRequests(_ context.Context, c PollContext) ([]RequestSpec, error) {
+	if a.manifest.Cancel == nil {
+		return nil, fmt.Errorf("protocol %s does not support cancellation", a.manifest.Metadata.ID)
+	}
+	request := c.Request
+	request.Model = c.Model
+	specs := make([]RequestSpec, 0, 1+len(a.manifest.CancelOperations))
+	primary, err := buildManifestOperation(*a.manifest.Cancel, a.manifest.Auth, request, c.TaskID)
+	if err != nil {
+		return nil, err
+	}
+	specs = append(specs, primary)
+	for index, operation := range a.manifest.CancelOperations {
+		if operation == nil {
+			continue
+		}
+		spec, err := buildManifestOperation(*operation, a.manifest.Auth, request, c.TaskID)
+		if err != nil {
+			return nil, fmt.Errorf("cancel operation %d: %w", index, err)
+		}
+		specs = append(specs, spec)
+	}
+	return specs, nil
+}
+
 func (a manifestAdapter) BuildResult(_ context.Context, c PollContext) (RequestSpec, error) {
 	if a.manifest.ResultOperation == nil {
 		return RequestSpec{}, fmt.Errorf("protocol %s has no result operation", a.manifest.Metadata.ID)
@@ -576,7 +628,9 @@ func (a manifestAdapter) BuildResult(_ context.Context, c PollContext) (RequestS
 
 func (a manifestAdapter) parse(payload map[string]any, c PollContext) CreateResult {
 	response := a.manifest.Response
-	env := map[string]any{"response": payload, "taskId": c.TaskID, "request": manifestRequestValues(c.Request)}
+	// baseUrl 让响应映射能把上游给的相对路径拼成可访问的绝对地址：本地部署的
+	// ComfyUI 只回 subfolder/filename，结果端点本身在同一个 origin 下。
+	env := map[string]any{"response": payload, "taskId": c.TaskID, "baseUrl": c.BaseURL, "request": manifestRequestValues(c.Request)}
 	id := manifestResponseString(response.TaskID, env)
 	if id == "" {
 		id = firstPathValue(payload, response.TaskIDPaths...)
