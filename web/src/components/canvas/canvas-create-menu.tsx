@@ -92,10 +92,10 @@ export function CanvasCreateMenu({ commands, layout = "grid", title = "添加节
             {showSectionTitles ? <MenuSection title="创作节点" color={theme.node.muted} /> : null}
             {layout === "list" ? <CanvasCreateCommandList commands={nodeCommands} /> : <CanvasCreateCommandGrid commands={nodeCommands} variant="node" />}
 
-            {layout !== "list" && workflowCommands.length ? (
+            {workflowCommands.length ? (
                 <>
                     <MenuSection title="工作流" color={theme.node.muted} spaced />
-                    <CanvasCreateCommandGrid commands={workflowCommands} variant="workflow" />
+                    {layout === "list" ? <CanvasCreateCommandList commands={workflowCommands} /> : <CanvasCreateCommandGrid commands={workflowCommands} variant="workflow" />}
                 </>
             ) : null}
 
