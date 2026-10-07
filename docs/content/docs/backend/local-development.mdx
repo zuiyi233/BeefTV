@@ -1,6 +1,6 @@
 ---
 title: 本地开发
-description: 在宿主机启动BeefTV前后端开发服务
+description: 在宿主机启动BeefTV前后端开发服务，桌面与浏览器形态的鉴权层次、操作层身份和 owner 凭据边界
 ---
 
 # 本地开发
@@ -129,6 +129,99 @@ curl -s -X POST http://127.0.0.1:8082/inference \
 构建发行包前必须设置 `BEEFTV_NODE_RUNTIME`：macOS 指向包含 `bin/node` 的官方 Node 目录，Windows 指向包含 `node.exe` 的官方 Node 目录。运行时版本、平台或架构不匹配都会终止构建；macOS 还会拒绝依赖 Homebrew 等非系统动态库的 Node。GitHub Actions 为每个平台准备固定版本运行时。
 
 打包脚本在临时目录使用 Bun 和 `agent-host/bun.lock` 安装冻结的 production 依赖，再以随包 Node 验证 SDK 导入。它不会复制开发目录中的 `node_modules`，也不会在缺少运行时时回退到系统 Node。两个发行入口分别为 `scripts/build-beeftv-release.sh` 和 `scripts/build-beeftv-windows-release.ps1`。
+
+## 桌面形态与浏览器形态的身份边界
+
+两种运行形态共用同一套 `/api` 路由，但入口门不同。用浏览器连 `cmd/server` 时按桌面的思路去找「启动令牌」一定会撞墙，所以先把层次分清楚：
+
+| 形态 | 入口 | Profile | 入口令牌（整个 `/api`） | 操作层身份（`/api/ops*`） |
+| --- | --- | --- | --- | --- |
+| 桌面 | `backend/cmd/desktop` | `bootstrap.ProfileDesktop` | `X-Desktop-Token` 必须正确 | 已登记客户端 / owner / 受信任桌面界面，三选一 |
+| 浏览器 + 独立服务 | `backend/cmd/server` | `ProfileServer` | 无这道门 | 同上，但「受信任桌面界面」这一路恒为假 |
+
+### 桌面形态：入口令牌之后还有第二层身份
+
+`backend/internal/bootstrap/runtime.go` 只在解析出的启动令牌非空时，才用 `backend/internal/transport/http/token.go` 的 `RequireLaunchToken` 包住整棵路由树（路由只挂在 `/api` 组下）。请求头常量是 `LaunchTokenHeader = "X-Desktop-Token"`，比对使用 `subtle.ConstantTimeCompare`，失败返回 HTTP 403 和 `reason=desktop_token_required`。豁免只有两类：
+
+1. `RequireLaunchToken` 内部放行 `OPTIONS` 预检和 `GET /api/health/live`；
+2. 接线处再放行「已登记外部客户端的操作层入口」：连接地址是回环、路径是 `GET /api/ops` 或 `POST /api/ops/<op>`（判据 `isOpsEntryPath`），并且 `X-Beeftv-Client` 与 `Authorization: Bearer <token>` 命中登记表。`/api/ops/clients` 属于凭据签发，不在豁免内。
+
+令牌来源是启动环境变量 `CANVAS_DESKTOP_LAUNCH_TOKEN`（`backend/cmd/desktop/app.go`）；未设置时由 `httptransport.NewLaunchToken()` 在组合根随机生成，只存在于该进程内存。WebView 不从构建期常量取它：`DesktopApp.RuntimeConfig()` 经 Wails 绑定返回 `baseURL` / `launchToken` / `uiBootstrapToken`，`web/src/services/desktop-runtime.ts` 拿到后为 `/api` 请求补上请求头；绑定尚未就绪时退回 `GET /__desktop/runtime-config`。由桌面内置资源处理器转发的 `/api` 请求，`X-Desktop-Token` 由后端自己注入。
+
+过了入口令牌不等于有身份。`resolveCaller`（`backend/internal/handler/agent_ops.go`）仍要求三者之一：
+
+- 已登记客户端：`X-Beeftv-Client` + `Authorization: Bearer`；
+- owner 凭据：`X-Beeftv-Owner` 等于数据目录里 `agent_owner_token` 的内容；
+- 受信任桌面界面：`desktopTrust` 同时校验 `X-Desktop-Token` **和** Wails 绑定给出的 `X-Beeftv-UI-Bootstrap`，单独出示启动令牌不构成受信任界面。
+
+三者都不满足时返回 HTTP 403、信封 `reason=forbidden`、`msg` 为「缺少可信身份：需要已登记的客户端凭据、owner 凭据或受信任的桌面界面」。因此只带正确 `X-Desktop-Token` 请求 `GET /api/ops` 仍是 403；补上 `X-Beeftv-Owner` 才得到 `code: 0`、`data.client = "owner"` 和完整操作清单。
+
+### 浏览器 + `cmd/server`：没有入口令牌，身份判定仍在
+
+`cmd/server` 不会传入启动令牌，`ProfileServer` 下解析出的令牌为空，入口门与 `DesktopTrust` 都不存在：
+
+- 访问 `/api/*` 不需要 `X-Desktop-Token`；带上它也没有任何作用，不要把它当成 403 的解法。
+- `/api/ops*` 依旧先过 `isLoopbackRequest`，再过 `resolveCaller`；`trustedDesktopUI` 因为 `DesktopTrust == nil` 恒为假，可走的身份只剩 owner 凭据或已登记客户端凭据。
+- `requireTrustedDesktopWritePrincipal`（任务创建与重试、字幕转写、时间线渲染、深度捕捉、创作写入）在没有 `DesktopTrust` 时放行工作区 owner，但只要请求带 `X-Beeftv-Client` 就 403：外部客户端凭据在独立服务形态下不能承担这些写入口，即使同时带上启动令牌也一样。
+- `BEEFTV_UI_BOOTSTRAP=1` 只改变两处判据（`backend/internal/handler/agent_clients.go` 与 `backend/internal/handler/agent_ui_session.go`）：桌面界面对外的 `/api/agent-clients*` 登记与吊销入口，以及 `POST /api/assistant/ui-session` 的签发。它不进入 `resolveCaller`，也不放松 `POST /api/ops/clients` 的 owner 要求，因此**不放开 `/api/ops`**。
+
+### `GET /api/ops` 返回 403 时怎么定位
+
+403 有两个互不相干的来源，先看 `msg` 再决定改哪一层：
+
+| `msg` | 判据所在 | 该改什么 |
+| --- | --- | --- |
+| 「操作层只接受本机请求」「客户端登记只接受本机请求」「只接受本机同源请求」 | `isLoopbackRequest` | 来源与 Origin 放行 |
+| 「缺少可信身份：需要已登记的客户端凭据、owner 凭据或受信任的桌面界面」 | `resolveCaller` | 出示 owner 或已登记客户端凭据 |
+
+`isLoopbackRequest` 要求 `Host` 与连接地址都是回环主机，并且 Origin 满足以下之一：缺省不发；桌面已鉴权时的 `wails://wails`、`http(s)://wails.localhost`；与 `Host` **主机和端口都一致**；出现在 `BEEFTV_ALLOWED_ORIGINS` 里。仅「是回环」不算同源。
+
+最常见的撞墙组合是：后端在 `127.0.0.1:8080`，浏览器页面在 `http://localhost:3000`，而 `web/vite.config.ts` 的 `/api` 代理带 `changeOrigin: true`，会把 `Host` 改写成 `127.0.0.1:8080`，浏览器发来的 `Origin` 仍是 `http://localhost:3000`——端口不一致即被拒。此时在启动后端时显式登记这个开发 Origin（多个用逗号分隔）：
+
+```bash
+cd backend
+CANVAS_BACKEND_DATA_DIR=../.local/project-workbench-debug \
+BEEFTV_ALLOWED_ORIGINS=http://localhost:3000 \
+go run ./cmd/server
+```
+
+`BEEFTV_ALLOWED_ORIGINS` 与 `CANVAS_CORS_ORIGINS` 不是一件事：前者是操作层的本机同源判据，后者是 `cmd/server` 的 CORS 门。另外 `cmd/server` 的 `corsAllowedHeaders` 不包含 owner 与客户端头，所以让页面跨源直连后端并出示这两种凭据走不通。当前可行的做法是让操作层调用与页面同源（走 dev 代理），或改用不发 `Origin` 的 `curl` / `beeftv` CLI。
+
+身份这一层，独立服务开发用 owner 通道最直接：
+
+```bash
+# 令牌值只在本机进程与终端里流转：从数据目录读取，不打印、不粘贴进任何文档或提交
+OWNER=$(cat ../.local/project-workbench-debug/agent_owner_token)
+curl -s http://127.0.0.1:8080/api/ops -H "X-Beeftv-Owner: ${OWNER}"
+```
+
+### owner 凭据落在哪里，怎么读
+
+`agent_owner_token` 由 `backend/internal/agentops/clients.go` 的 `OwnerTokenPath` / `EnsureOwnerToken` 写在**后端数据目录**根下，权限 0600；首次访问操作层时按需用 `OwnerTokenMatches` 生成。两种形态都会准备这份凭据（组合根在注册路由前无条件调用 `EnsureAgentCredentials`，不按 Profile 分支），所以它的位置只取决于启动时用的数据目录，而不是某个固定绝对路径：
+
+| 形态 | 数据目录来源 |
+| --- | --- |
+| 桌面发行包 | 应用自身的用户数据目录，见「桌面自动更新发布」的数据保留表 |
+| 宿主机开发（`cmd/server`） | `CANVAS_BACKEND_DATA_DIR`，本仓库约定为 `.local/project-workbench-debug` |
+| 未设置 `CANVAS_BACKEND_DATA_DIR` | `cmd/server` 回退到相对路径 `data` |
+
+读取方式统一为「取当前数据目录下的 `agent_owner_token` 文件内容」：`cat "<数据目录>/agent_owner_token"`。不要把真实值写进文档、日志、issue、提交信息或浏览器 URL。它是完整工作区写权限的凭据，与「本机上能直接读该数据目录的进程」等价，因此 owner 通道是为手工界面与本机直连准备的**联调通道，不是推荐的多客户端或生产做法**。
+
+### 多个客户端：登记客户端凭据
+
+要让 Codex、Claude Code、Cursor 或其他 MCP 客户端连同一份工作区时，签发各自的凭据，而不是把 owner 交出去：
+
+```bash
+BEEFTV_BASE_URL=http://127.0.0.1:8080/api \
+BEEFTV_OWNER_TOKEN="$(cat ../.local/project-workbench-debug/agent_owner_token)" \
+beeftv client register --label dev-agent --mode read-only
+```
+
+`beeftv client register` 走 `POST /api/ops/clients`，按合同只接受 owner 凭据（`requireOwner`）；桌面形态下这条路径还额外要入口令牌，因为它不在入口豁免里。登记返回的 token 只在该次响应出现一次，服务端只保存哈希；能力模式（`read-only` / `read-write`）由服务端登记决定，请求头和请求体都不能自行提升。桌面界面的「外部 Agent」使用 `backend/internal/handler/agent_clients.go` 的入口做同一件事。只读是操作层与 MCP 的策略边界而非操作系统级隔离，完整口径见「本地 HTTP API」的只读边界一节。
+
+### 别把来源放行当成出网放行
+
+`BEEFTV_ALLOWED_ORIGINS` 只影响「这个请求算不算本机同源」，不会打开任何出网能力。出网侧仍默认拒绝本机、私网和链路本地上游，只能按**主机名**精确放行 `CANVAS_ALLOWED_PRIVATE_UPSTREAM_HOSTS`（见「ComfyUI 工作流」的前置条件一节）。本项目不提供「允许全部私网」这种联调绕法：上游被拒时补具体主机名，不要放开整段网段。
 
 ## Docker 开发
 
