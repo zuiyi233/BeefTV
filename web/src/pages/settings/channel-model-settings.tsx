@@ -10,7 +10,8 @@ import { type ModelCapabilityChoice } from "@/components/model-protocol-picker";
 import { defaultModelCapabilityConfig } from "@/lib/model-capabilities";
 import { defaultProtocolForCapability, defaultProtocolForModel, inferProtocolCapabilityFromModel, modelProtocolCapability, modelProtocolDefinition, type ModelProtocol, type ModelProtocolDefinition } from "@/lib/model-protocols";
 import { fetchPluginProviderCatalog } from "@/services/api/plugin-catalog";
-import { modelOptionName, type ModelChannel } from "@/stores/use-config-store";
+import { CHATGPT_SUBSCRIPTION_INTERFACE } from "@/services/api/chatgpt-connection";
+import { modelOptionName, MANAGED_CHATGPT_CREDENTIAL_REF, type ModelChannel } from "@/stores/use-config-store";
 import { currentModelConnectionReceipt, useModelConnectionTests } from "@/stores/use-model-connection-tests";
 
 type ModelProfile = NonNullable<ModelChannel["modelProfiles"]>[number];
@@ -25,6 +26,10 @@ export function ChannelModelSettings({ channel, onChange, draft = false }: { cha
     const [availableProtocols, setAvailableProtocols] = useState<ModelProtocolDefinition[]>([]);
     const { receipts, record } = useModelConnectionTests();
     const testResult = activeModel ? currentModelConnectionReceipt(receipts, channel, activeModel) : undefined;
+
+    // 订阅渠道的模型必须走订阅协议；否则新增模型会退回默认兼容协议并绕过订阅凭据。
+    const subscriptionChannel = channel.credentialRef === MANAGED_CHATGPT_CREDENTIAL_REF || channel.interfaceType === CHATGPT_SUBSCRIPTION_INTERFACE;
+    const fallbackProtocolForModel = (model: string) => (subscriptionChannel ? CHATGPT_SUBSCRIPTION_INTERFACE : defaultProtocolForModel(model, availableProtocols));
 
     useEffect(() => {
         let active = true;
@@ -56,7 +61,7 @@ export function ChannelModelSettings({ channel, onChange, draft = false }: { cha
     }
 
     const updateProfile = (model: string, patch: Partial<ModelProfile>) => {
-        const defaultProtocol = defaultProtocolForModel(model, availableProtocols);
+        const defaultProtocol = fallbackProtocolForModel(model);
         const defaultCap = modelProtocolCapability(defaultProtocol, availableProtocols) || inferProtocolCapabilityFromModel(model);
         const current = channel.modelProfiles?.find((item) => item.model === model) || {
             model,
@@ -84,7 +89,7 @@ export function ChannelModelSettings({ channel, onChange, draft = false }: { cha
     };
 
     const activeModelProfile = activeModel ? channel.modelProfiles?.find((item) => item.model === activeModel) : undefined;
-    const inferredProtocol = activeModel ? defaultProtocolForModel(activeModel, availableProtocols) : "";
+    const inferredProtocol = activeModel ? fallbackProtocolForModel(activeModel) : "";
     const activeProtocol = activeModelProfile?.protocol || inferredProtocol;
     const activeCapability = activeModelProfile?.capability || modelProtocolCapability(activeProtocol, availableProtocols) || (activeModel ? inferProtocolCapabilityFromModel(activeModel) : "text");
 
@@ -101,7 +106,7 @@ export function ChannelModelSettings({ channel, onChange, draft = false }: { cha
                 {channel.models.map((rawModel) => {
                     const model = modelOptionName(rawModel);
                     const profile = channel.modelProfiles?.find((item) => item.model === model);
-                    const protocol = profile?.protocol || defaultProtocolForModel(model, availableProtocols);
+                    const protocol = profile?.protocol || fallbackProtocolForModel(model);
                     const capability = profile?.capability || modelProtocolCapability(protocol, availableProtocols) || inferProtocolCapabilityFromModel(model);
                     const displayName = profile?.displayName?.trim() || model;
                     return (
