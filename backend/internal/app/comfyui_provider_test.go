@@ -51,11 +51,11 @@ func TestComfyUIAppInterfaceGateAndPluginMapping(t *testing.T) {
 			t.Fatalf("%s 不应识别为 ComfyUI 工作流渠道", value)
 		}
 	}
-	if supportsProviderCancellation("comfyui-workflow-audio") {
+	if supportsProviderCancellation(context.Background(), providerConfig{InterfaceType: "comfyui-workflow-audio"}, "pid-1") {
 		t.Fatal("未接入的接口不应声明取消能力")
 	}
 	for _, value := range []string{"comfyui-workflow-image", "comfyui-workflow-video"} {
-		if !supportsProviderCancellation(value) {
+		if !supportsProviderCancellation(context.Background(), providerConfig{InterfaceType: value}, "pid-1") {
 			t.Fatalf("%s 应支持取消", value)
 		}
 	}
