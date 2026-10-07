@@ -258,7 +258,10 @@ func validateRunningHubWorkflowFieldValue(field Field, value interface{}) error 
 			return fmt.Errorf("工作流字段 %s 不是有效开关值", fieldID)
 		}
 	}
-	if options := workflowFieldAllowedOptions(field); len(options) > 0 {
+	// 参考素材字段的值由宿主上传后回填（resolveWorkflowFieldValue 走 files[media.ID]），
+	// 而 Options 是解析工作流时从上游枚举接口抓的快照：刚上传的文件名按构造不可能出现在
+	// 旧快照里。这类字段跳过枚举校验，数值、范围与开关校验仍然照常执行。
+	if options := workflowFieldAllowedOptions(field); len(options) > 0 && !workflowFieldUsesUploadedMedia(field) {
 		encoded := strings.TrimSpace(workflowScalarString(value))
 		matched := false
 		hasScalarOption := false
@@ -470,6 +473,21 @@ func normalizeWorkflowFieldSource(field Field) string {
 	default:
 		return ""
 	}
+}
+
+// workflowFieldUsesUploadedMedia 与 resolveWorkflowFieldValue 的参考素材分支使用同一组
+// 归一化写法：命中它的字段，值一定来自宿主刚上传的文件名，而不是用户可选项。
+// 两处写法必须保持一致，否则会出现「校验放行但解析取不到素材」的错位。
+func workflowFieldUsesUploadedMedia(field Field) bool {
+	source := strings.ReplaceAll(strings.ReplaceAll(normalizeWorkflowFieldSource(field), "_", ""), "-", "")
+	switch source {
+	case "referenceimage", "image", "referenceimages",
+		"referencevideo", "video", "referencevideos",
+		"referenceaudio", "audio", "referenceaudios",
+		"mask":
+		return true
+	}
+	return false
 }
 
 func workflowDimensionPart(mode string, size string, videoQuality string, index int) string {

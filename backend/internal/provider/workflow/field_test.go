@@ -142,3 +142,35 @@ func TestOutputHostRewriteIsFixed(t *testing.T) {
 		t.Fatal("unrelated host must stay unchanged")
 	}
 }
+
+// 参考素材字段的值是宿主刚上传的文件名，解析期抓的枚举快照按构造不可能包含它；
+// 但豁免只能覆盖枚举，普通枚举字段与数值范围校验必须照常拒绝。
+func TestUploadedMediaFieldsSkipOptionValidation(t *testing.T) {
+	options := []interface{}{"known-a.png", "known-b.png"}
+	uploaded := Field{NodeID: "10", FieldName: "image", FieldType: "COMBO", Source: "referenceImage", Options: options}
+	if err := validateRunningHubWorkflowFieldValue(uploaded, "reference-uploaded.png"); err != nil {
+		t.Fatalf("刚上传的参考素材被枚举校验拒绝：%v", err)
+	}
+
+	static := Field{NodeID: "12", FieldName: "preset", FieldType: "COMBO", Options: options}
+	if err := validateRunningHubWorkflowFieldValue(static, "not-an-option"); err == nil || !strings.Contains(err.Error(), "不在允许选项中") {
+		t.Fatalf("普通枚举字段必须继续拒绝未知值，得到 %v", err)
+	}
+	if err := validateRunningHubWorkflowFieldValue(static, "known-a.png"); err != nil {
+		t.Fatalf("合法枚举值被拒绝：%v", err)
+	}
+
+	numeric := Field{NodeID: "13", FieldName: "steps", FieldType: "INT", Min: 1, Max: 10}
+	if err := validateRunningHubWorkflowFieldValue(numeric, 40); err == nil {
+		t.Fatal("超出范围的数值被接受")
+	}
+
+	for _, source := range []string{"referenceImage", "reference_image", "IMAGE", "referencevideos", "audio", "mask"} {
+		if !workflowFieldUsesUploadedMedia(Field{FieldName: "x", Source: source}) {
+			t.Fatalf("来源 %q 应绑定宿主上传素材", source)
+		}
+	}
+	if workflowFieldUsesUploadedMedia(Field{FieldName: "text", Source: "prompt"}) {
+		t.Fatal("提示词来源不应视为上传素材")
+	}
+}

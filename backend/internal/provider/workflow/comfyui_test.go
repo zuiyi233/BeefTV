@@ -527,7 +527,9 @@ func TestComfyUIWorkflowUploadsReferenceImageAndInjectsFilename(t *testing.T) {
 			"6":  map[string]interface{}{"class_type": "CLIPTextEncode", "inputs": map[string]interface{}{"text": "x"}},
 		},
 		WorkflowFields: []Field{
-			{NodeID: "10", FieldName: "image", FieldType: "COMBO", Source: "referenceImage", ImageOrder: 1, Required: true},
+			// Options 是解析期从 /object_info 抓的快照，不含稍后上传得到的文件名；
+			// 参考素材字段必须跳过枚举校验，否则真机图生图会在提交前被判非法值。
+			{NodeID: "10", FieldName: "image", FieldType: "COMBO", Source: "referenceImage", ImageOrder: 1, Required: true, Options: []interface{}{"workflow-default.png", "unrelated.png"}},
 			{NodeID: "6", FieldName: "text", FieldType: "STRING", Source: "prompt"},
 		},
 	}
@@ -738,5 +740,26 @@ func TestComfyUIConfigValidationRequiresWorkflowJSONAndOutboundAllowance(t *test
 		WorkflowJSON:  workflowJSON,
 	}); err == nil {
 		t.Fatal("ComfyUI 尚未支持音频")
+	}
+}
+
+// ComfyUI 目前只实现了图片参考的上传与注入。视频、音频与蒙版必须显式失败，
+// 不能让素材被静默丢弃后提交一份与用户输入不符的工作流。
+func TestComfyUIRejectsUnsupportedReferenceMedia(t *testing.T) {
+	cases := map[string]Input{
+		"视频参考": {Mode: "image", Prompt: "x", ReferenceVideos: []Media{{ID: "v-1", Type: "video/mp4"}}},
+		"音频参考": {Mode: "image", Prompt: "x", ReferenceAudios: []Media{{ID: "a-1", Type: "audio/mp3"}}},
+		"蒙版":     {Mode: "image", Prompt: "x", Mask: &Media{ID: "m-1", Type: "image/png"}},
+	}
+	for name, input := range cases {
+		input.Config = Config{
+			InterfaceType: string(model.ChannelInterfaceComfyUIImage),
+			BaseURL:       "http://127.0.0.1:8188",
+			WorkflowJSON:  map[string]interface{}{"10": map[string]interface{}{"class_type": "LoadImage", "inputs": map[string]interface{}{"image": "default.png"}}},
+		}
+		_, err := newComfyUITestClient().RunComfyUI(context.Background(), input)
+		if err == nil || !strings.Contains(err.Error(), "暂不支持视频、音频参考素材与蒙版") {
+			t.Fatalf("%s 应显式拒绝，得到 %v", name, err)
+		}
 	}
 }
