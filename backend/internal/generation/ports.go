@@ -73,6 +73,10 @@ type ReceiptPort interface {
 	Observe(observation TransportObservation)
 	NotifyPoll(ctx context.Context, event string, err error)
 	SyncProgress(taskID string, body []byte)
+	// RecordAccepted 在 create 被上游受理的那一刻把 provider 请求 id 交给宿主持久化，
+	// 不等 api_call_logs 回灌：取消与对账要引用的就是这一个值。实现必须幂等（重入、
+	// 重试写同一条句柄不得产生第二种状态），并且不能覆盖调用日志的调度字段。
+	RecordAccepted(ctx context.Context, providerRequestID string) error
 }
 
 // StagePort reports execution stages without inventing provider progress.

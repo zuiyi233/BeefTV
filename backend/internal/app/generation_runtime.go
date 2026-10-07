@@ -143,6 +143,42 @@ func (p appReceiptPort) SyncProgress(taskID string, body []byte) {
 	p.service.syncProviderTaskProgress(taskID, body)
 }
 
+// RecordAccepted 在上游受理声明式任务的瞬间把 provider 请求 id 写进任务行，取消与对账
+// 不必再等 api_call_logs 回灌。落库位置与既有实现一致：走 repo.UpdateTaskProviderState
+// 写 provider_request_id（同 recordWorkflowProviderRequest、provider_task_recovery.go），
+// 不新建上下文字段，也不写入 URL、凭证或响应正文。
+//
+// 与回灌共存且不互相覆盖：两条链路写同一列、同一个句柄，重复写幂等；poll_stage 与
+// next_poll_at 按任务当前值原样回写（同 provider_task_recovery.go 的做法），调度节奏
+// 仍然归调用日志和轮询循环所有。
+func (p appReceiptPort) RecordAccepted(ctx context.Context, providerRequestID string) error {
+	call := canonicalCallMeta(ctx)
+	// 没有 TaskID 说明这次执行不绑定本地任务（渠道模型试跑、独立生成、设置页探针），
+	// 无回执可记；一旦有任务身份，任何写失败都必须向上抛，不能假装受理已被记录。
+	if strings.TrimSpace(call.TaskID) == "" {
+		return nil
+	}
+	requestID := strings.TrimSpace(providerRequestID)
+	if requestID == "" {
+		return errors.New("声明式协议受理回执缺少上游任务 ID")
+	}
+	if p.service == nil || p.service.repo == nil {
+		return errors.New("声明式协议缺少本地任务受理回执上下文")
+	}
+	userID := strings.TrimSpace(call.UserID)
+	if userID == "" {
+		return errors.New("声明式协议缺少本地任务归属用户上下文")
+	}
+	task, err := p.service.repo.TaskForUser(userID, strings.TrimSpace(call.TaskID))
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(task.ProviderRequestID) == requestID {
+		return nil
+	}
+	return p.service.repo.UpdateTaskProviderState(task.ID, requestID, task.PollStage, task.NextPollAt)
+}
+
 type appImagePort struct{ service *Service }
 
 func (p appImagePort) Intercept(req *http.Request) (bool, []byte, string, error) {

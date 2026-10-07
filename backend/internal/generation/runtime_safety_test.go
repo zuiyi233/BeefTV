@@ -24,6 +24,9 @@ type nopReceipts struct{}
 func (nopReceipts) Observe(TransportObservation)              {}
 func (nopReceipts) NotifyPoll(context.Context, string, error) {}
 func (nopReceipts) SyncProgress(string, []byte)               {}
+func (nopReceipts) RecordAccepted(context.Context, string) error {
+	return nil
+}
 
 type recordingReceipts struct {
 	mu    sync.Mutex
@@ -38,6 +41,9 @@ func (r *recordingReceipts) Observe(observation TransportObservation) {
 
 func (r *recordingReceipts) NotifyPoll(context.Context, string, error) {}
 func (r *recordingReceipts) SyncProgress(string, []byte)               {}
+func (r *recordingReceipts) RecordAccepted(context.Context, string) error {
+	return nil
+}
 
 func (r *recordingReceipts) snapshot() []TransportObservation {
 	r.mu.Lock()

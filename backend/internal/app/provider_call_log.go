@@ -9,6 +9,17 @@ import (
 	"infinite-canvas/backend/internal/model"
 )
 
+// providerRequestIDKeys 是"上游任务标识"候选键，按具体到泛化排序：取消、对账和人工恢复
+// 只能拿这些值去定位上游那条任务，所以显式的任务句柄必须先于泛化的 id 命中。
+//   - prompt_id：ComfyUI 原生 /prompt 的受理响应，同时也是 /history/{prompt_id}、
+//     /queue delete、/interrupt 唯一的任务句柄（见 provider/workflow/comfyui.go）。
+//   - taskId：声明式插件 catalog 里最常见的驼峰写法，与宿主 {{taskId}} 占位符同名。
+//   - video_id：Agnes 视频协议把任务句柄放在 video_id，轮询即 query video_id={{taskId}}。
+//
+// 顺序上把 task_id/taskId/prompt_id/video_id 放在 id 之前，与既有实现"先认显式任务字段"
+// 一致；插件自己声明的 taskIdPaths 优先由受理回执落库，这里只兜住回灌链路。
+var providerRequestIDKeys = []string{"task_id", "taskId", "prompt_id", "video_id", "id", "request_id", "name"}
+
 // EnrichAPICallLog extracts provider recovery identifiers, usage and failure
 // details. This is operational task state, not SaaS engagement analytics.
 func (s *Service) EnrichAPICallLog(log *model.ApiCallLog, responseBody []byte) {
@@ -104,7 +115,7 @@ func (s *Service) enrichAPICallLogPayload(log *model.ApiCallLog, payload map[str
 		}
 		log.CachedTokens = firstInt64(usage, "cachedContentTokenCount")
 	}
-	if extracted, err := firstJSONString(payload, "task_id", "id", "request_id", "name"); err == nil {
+	if extracted, err := firstJSONString(payload, providerRequestIDKeys...); err == nil {
 		log.ProviderRequestID = firstNonEmpty(nestedTaskID, extracted, log.ProviderRequestID)
 	} else {
 		log.ProviderRequestID = firstNonEmpty(nestedTaskID, log.ProviderRequestID)
@@ -162,6 +173,11 @@ func providerResponsePayloads(responseBody []byte) []map[string]any {
 	return result
 }
 
+// providerRequestIDPathCollections 是"父段为任务集合、末段即上游任务句柄"的路径段。
+// history 来自 ComfyUI 原生 /history/{prompt_id}：该响应以 prompt_id 作顶层 key，
+// 正文里没有可取值的句柄字段，只能从路径回推，否则轮询与取消日志依旧带不出上游 id。
+var providerRequestIDPathCollections = map[string]bool{"videos": true, "tasks": true, "history": true}
+
 func providerRequestIDFromPath(path string) string {
 	parts := strings.Split(strings.Trim(strings.TrimSpace(path), "/"), "/")
 	for index := len(parts) - 1; index >= 0; index-- {
@@ -169,7 +185,7 @@ func providerRequestIDFromPath(path string) string {
 		if part == "" || part == "content" || part == "download" {
 			continue
 		}
-		if index > 0 && (parts[index-1] == "videos" || parts[index-1] == "tasks") {
+		if index > 0 && providerRequestIDPathCollections[parts[index-1]] {
 			return part
 		}
 		break

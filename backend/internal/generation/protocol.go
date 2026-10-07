@@ -58,9 +58,41 @@ func DeclarativeProtocolPollPolicy(mode string) VideoPollPolicy {
 	}
 }
 
+// DeclaredProtocolPollPolicy 读取 provider 在 manifest 的 poll.policy 里为自己声明的
+// 轮询节奏。第二个返回值为 false 表示该 provider 没有声明（或这个适配器根本不是声明式
+// provider），宿主必须保持自己的默认节奏——协议层不产出任何默认值。
+func DeclaredProtocolPollPolicy(adapter protocol.Adapter) (protocol.PollPolicy, bool) {
+	source, ok := adapter.(protocol.PollPolicyAdapter)
+	if !ok {
+		return protocol.PollPolicy{}, false
+	}
+	return source.PollPolicy()
+}
+
+// ApplyDeclaredPollPolicy 把插件声明的节奏接到宿主传入的节奏上，只覆盖 Interval。
+//
+// 边界是刻意的：
+//   - 只认 intervalSeconds。越界值（<=0 之外的负数、>300）在协议层 ValidateManifest
+//     就被拒绝，宿主只会看到合法值或表示“未声明”的 0；0 与读不到都按未声明处理，
+//     原样返回宿主节奏。
+//   - InitialDelay、not-found/malformed/download 预算属于宿主的排队与恢复策略，不受声明影响。
+//   - 不采纳 timeoutSeconds。宿主的执行窗口（taskExecutionTimeoutWithPolicy）、worker 租约
+//     和 PollingDeadline 是权威：延长会让插件越过宿主超时，收窄则让插件单方面放弃仍在
+//     生成且已付费的上游任务，两种都不是插件的权限。宿主因此不读取该字段。
+func ApplyDeclaredPollPolicy(adapter protocol.Adapter, policy VideoPollPolicy) VideoPollPolicy {
+	declared, ok := DeclaredProtocolPollPolicy(adapter)
+	if !ok || declared.IntervalSeconds <= 0 {
+		return policy
+	}
+	policy.Interval = time.Duration(declared.IntervalSeconds) * time.Second
+	return policy
+}
+
 func RunProtocolAdapterTaskWithPolicy(ctx context.Context, input Input, adapter protocol.Adapter, policy VideoPollPolicy) (map[string]interface{}, error) {
 	// create、poll、download 是同一个外部任务的三个阶段：任一阶段失败都向上返回真实错误，
 	// 不把“已提交但结果未知”伪装成成功，也不把下载失败降级成空结果。
+	// 声明式 provider 在这里统一套用插件为自己声明的轮询间隔；未声明时保持调用方传入的节奏。
+	policy = ApplyDeclaredPollPolicy(adapter, policy)
 	request := ProtocolRequestFromInput(input)
 	taskID := ResumedProviderRequestID(ctx)
 	var created protocol.CreateResult
@@ -72,7 +104,15 @@ func RunProtocolAdapterTaskWithPolicy(ctx context.Context, input Input, adapter 
 			key = uuid.NewString()
 		}
 		request.Extra["idempotencyKey"] = key
-		spec, err := adapter.BuildCreate(ctx, protocol.RequestContext{BaseURL: input.Config.BaseURL, Request: request})
+		// 预上传插在 BuildCreate 之前：provider 声明的 uploads[] 必须先落到上游，捕获值才能被
+		// create/poll/result 的表达式引用。任一步失败都在这里返回真实错误，绝不带着未上传的
+		// 素材提交计费任务；恢复路径不会进入这个分支，因此也不会重复上传。
+		uploadCtx, err := runProtocolUploads(ctx, input, adapter, request)
+		if err != nil {
+			return nil, err
+		}
+		ctx = uploadCtx
+		spec, err := adapter.BuildCreate(ctx, protocolRequestContext(ctx, input, request))
 		if err != nil {
 			return nil, err
 		}
@@ -110,10 +150,16 @@ func RunProtocolAdapterTaskWithPolicy(ctx context.Context, input Input, adapter 
 		if taskID == "" {
 			return nil, SubmissionUnknownError{Cause: errors.New("创建请求未返回可查询的任务 ID，请核对供应商任务记录")}
 		}
+		// 上游已经受理这条任务：立刻把句柄变成持久记录，取消与对账不再等 api_call_logs
+		// 回灌。记账失败必须向上抛——「已受理但本地没记账」就是提交结果未知，按既有
+		// 契约阻断自动重试，不能把它降级成看起来还能安全重发的普通错误。
+		if err := recordProtocolAcceptance(ctx, taskID); err != nil {
+			return nil, SubmissionUnknownError{Cause: err}
+		}
 	}
 
 	return RunVideoPollLoop(ctx, taskID, policy, func(ctx context.Context) (VideoPollOutcome, error) {
-		spec, err := adapter.BuildPoll(ctx, protocol.PollContext{BaseURL: input.Config.BaseURL, Model: request.Model, Request: request, TaskID: taskID})
+		spec, err := adapter.BuildPoll(ctx, protocolPollContext(ctx, input, request, taskID))
 		if err != nil {
 			return VideoPollOutcome{}, err
 		}
@@ -121,7 +167,7 @@ func RunProtocolAdapterTaskWithPolicy(ctx context.Context, input Input, adapter 
 		if err != nil {
 			return VideoPollOutcome{}, err
 		}
-		state, err := adapter.ParsePoll(ctx, protocol.PollContext{BaseURL: input.Config.BaseURL, Model: request.Model, Request: request, TaskID: taskID}, body)
+		state, err := adapter.ParsePoll(ctx, protocolPollContext(ctx, input, request, taskID), body)
 		if err != nil {
 			return VideoPollOutcome{}, err
 		}
@@ -139,17 +185,36 @@ func RunProtocolAdapterTaskWithPolicy(ctx context.Context, input Input, adapter 
 	})
 }
 
+// recordProtocolAcceptance 把声明式 create 刚拿到的上游任务句柄交给宿主回执端口。
+// 没有绑定运行时、或调用方显式关断了记账（WithoutCallAccounting、独立生成与设置页
+// 探针）时，本来就没有本地任务可写，这里保持空操作；端口存在却写失败则是真实故障，
+// 原样向上返回，由调用点转换成"提交结果未知"。
+func recordProtocolAcceptance(ctx context.Context, taskID string) error {
+	runtime, ok := RuntimeFromContext(ctx)
+	if !ok || runtime.Receipts == nil {
+		return nil
+	}
+	if strings.TrimSpace(taskID) == "" {
+		return nil
+	}
+	return runtime.Receipts.RecordAccepted(ctx, strings.TrimSpace(taskID))
+}
+
+// ExtractProviderTaskID 是 provider 没在 manifest 里声明 taskIdPaths 时的兜底。
+// 新追加的 prompt_id（ComfyUI 原生受理响应）与 video_id（Agnes 视频句柄）插在
+// task_id/taskId 之后、request_id/name 之前：既有的 id 优先级保持不动，因此只会把
+// "完全取不到句柄"变成"有句柄可取消/轮询"，不会改写已经能取到句柄的协议的结果。
 func ExtractProviderTaskID(body []byte) (string, error) {
 	var payload map[string]interface{}
 	if json.Unmarshal(body, &payload) != nil {
 		return "", nil
 	}
-	id, err := firstJSONString(payload, "id", "task_id", "taskId", "request_id", "name")
+	id, err := firstJSONString(payload, "id", "task_id", "taskId", "prompt_id", "video_id", "request_id", "name")
 	if id != "" {
 		return id, nil
 	}
 	if data, ok := payload["data"].(map[string]interface{}); ok {
-		nested, nestedErr := firstJSONString(data, "id", "task_id", "taskId", "request_id")
+		nested, nestedErr := firstJSONString(data, "id", "task_id", "taskId", "prompt_id", "video_id", "request_id")
 		if nested != "" {
 			return nested, nil
 		}
@@ -164,7 +229,7 @@ func ExtractProviderTaskID(body []byte) (string, error) {
 // 人工恢复走此路径，因此检查本地失败任务时绝不会创建第二个上游任务。
 func QueryProtocolAdapterVideoTask(ctx context.Context, input Input, adapter protocol.Adapter, taskID string) (map[string]interface{}, string, error) {
 	request := ProtocolRequestFromInput(input)
-	pollContext := protocol.PollContext{BaseURL: input.Config.BaseURL, Model: request.Model, Request: request, TaskID: taskID}
+	pollContext := protocolPollContext(ctx, input, request, taskID)
 	spec, err := adapter.BuildPoll(ctx, pollContext)
 	if err != nil {
 		return nil, "", err
@@ -957,7 +1022,7 @@ func FinishProtocolAdapterResult(ctx context.Context, input Input, adapter proto
 	if !ok || !hasCapability || !capability.ResultAvailable() {
 		return FinishProtocolResult(ctx, input.Config, input.Mode, taskID, result, pollPolicy)
 	}
-	spec, err := resultAdapter.BuildResult(ctx, protocol.PollContext{BaseURL: input.Config.BaseURL, Model: request.Model, Request: request, TaskID: taskID})
+	spec, err := resultAdapter.BuildResult(ctx, protocolPollContext(ctx, input, request, taskID))
 	if err != nil {
 		return nil, err
 	}
