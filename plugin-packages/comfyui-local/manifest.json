@@ -1,0 +1,854 @@
+{
+  "apiVersion": "beeftv.plugin/v2",
+  "id": "comfyui-local",
+  "name": "本地 ComfyUI（原生协议）",
+  "version": "2.0.0",
+  "author": "BeefTV Contributors",
+  "description": "本机 ComfyUI 原生 /prompt、/history、/view、/upload/image、/queue 与 /interrupt 协议的声明式插件。",
+  "documentation": "# 本地 ComfyUI（原生协议）\n\n该目录是 BeefTV 声明式协议插件源码。后端从生成的 `comfyui-local.beeftv-plugin` 包加载，不依赖系统内置 `host:` 适配器。\n\n本插件由 BeefTV Contributors 维护，用于适配 Comfy Org 的 ComfyUI 本地服务接口；不表示 BeefTV 与 ComfyUI 项目存在隶属、授权或合作关系。\n\n它把**当前由 Go 硬编码实现的本机 ComfyUI 出图链路**（`backend/internal/provider/workflow/comfyui.go`）表达成声明式协议：提交宿主映射好的工作流图、轮询 `/history/{prompt_id}`、用 `/view` 取图、图生图先走 `/upload/image`、取消时补发 `/interrupt`。\n\n完整接口见 [docs/interface.md](docs/interface.md)。\n\n## 当前状态：源码可用，**尚未启用**\n\n本包**没有**生成 `.beeftv-plugin`，也不应安装。本机 ComfyUI 现在仍由 Go 实现提供，已在真机验收文生图、图生图与取消。把它切到本包之前，还差三件协议层无法表达的事：\n\n1. **outputs 的动态节点键无法枚举**。`/history` 的 `outputs` 以节点 id 为顶层键，声明式映射只能读固定键；一张图里多个 `SaveImage` 会漏产物。\n2. **取消对账的四态没有声明端口**。Go 侧要先判 `execution_interrupted` 再判 `completed`，并把「既不在队列也不在 history」判为已确认；`cancelOperations` 只保证两次请求按序发出，表达不了这套判定。\n3. **切流判定尚未反转**。`generation/executor.go` 目前只要 interface 属于工作流 provider 就走 Go 路径；本包的 provider id 已按目标接口填写，但在判定反转前安装它会与 Go 路径争同一个 interface。\n\n另外两条属于**宿主要保留的接缝**，不是缺陷：工作流字段映射（含把 `/upload/image` 返回的 `subfolder/name` 回填进 `LoadImage` 节点）始终由宿主完成；`client_id` 的随机性由宿主产生。\n\n## 前置条件\n\n1. 本机或同一可信网络内已运行 ComfyUI，默认地址 `http://127.0.0.1:8188`。渠道 Base URL 填 ComfyUI 的**根地址**，不要带 `/prompt`、`/api` 之类路径。\n2. BeefTV 默认拒绝本机、私网和链路本地上游。必须按主机名精确放行，多个主机用逗号分隔：\n\n   ```bash\n   CANVAS_ALLOWED_PRIVATE_UPSTREAM_HOSTS=127.0.0.1\n   ```\n\n   通过局域网主机名或反代域名访问时，只放行那一个主机名。**不要**用「允许全部私网」的写法绕过 SSRF 防护：那会让插件渠道变成对内网任意端口的读取通道。\n3. 工作流必须是 **API 格式**（`{\"<节点 id>\": {\"class_type\": ..., \"inputs\": {...}}}`），即 ComfyUI「Save (API Format)」导出的图，不是前端带 `nodes`/`links` 的 UI 导出。\n4. 反向代理挂在路径前缀下（例如 `https://gw.example.com/comfy`）时照常填写即可：本包所有端点都声明 `originPath: true`，实际请求路径会替换掉 Base URL 自带的**路径段**，只保留协议、主机和端口。代理必须允许 `POST /prompt`、`GET /history/{id}`、`GET /view`、`POST /upload/image`、`POST /queue`、`POST /interrupt` 这些根路径。\n\n## 能力边界\n\n- 只声明 `image` 能力，只覆盖已在真机验收过的三段链路：文生图、图生图（参考图）、取消。\n- **工作流字段映射不在本包里**。`create.body.prompt` 取 `request.workflow.json`，即宿主已经映射好的图对象。分辨率、步数、采样器、scheduler、cfg、denoise、seed 这些参数如何落到 `EmptyLatentImage`/`KSampler` 的哪个字段，仍由宿主的字段映射与 `/object_info` 元数据负责；本包不解析、不改写图里任何节点。\n- `create.body.client_id` 取 `request.workflow.clientId`：随机性由宿主产生，表达式语言本身没有随机数算子。\n- 图生图的参考图先由 `uploads[]` 预上传到 ComfyUI 的 `input` 目录，`LoadImage.image` 的 `subfolder/name` 回填仍属于宿主映射步骤（原因见 interface.md「宿主必须保留的接缝」）。\n- 拒绝视频、音频参考与蒙版：ComfyUI 侧需要对应的加载节点与 `/upload/mask` 流程，本阶段未实现，用 `validations[].assert` 在提交前显式失败，不静默丢弃素材。\n- 不使用 WebSocket 进度（`/ws?clientId=`），只做 `/history` 轮询。\n- 产物地址是 `baseUrl` 拼出来的 `/view` 绝对地址，`resultEphemeral: true`：宿主成功后立即下载并持久化，不把本机地址写进素材记录。\n\n## 与 Go 实现的差异\n\n| 环节 | Go 实现 | 本包 |\n| --- | --- | --- |\n| 提交 | `POST /prompt`，`{\"prompt\",\"client_id\"}`，`client_id` 每次随机 16 字节 hex | 同一请求；`client_id` 透传宿主下发的 `request.workflow.clientId`，缺省即省略该键 |\n| 参考图 | `LocalBytes` 取本机字节 → multipart **表单字段** `type=input`、`overwrite=true` | `uploads[]` 声明 multipart **查询参数** `type`、`overwrite`；传参位置与 Go 不同，切流前需真机复核上游读哪一侧 |\n| 轮询 | `workflow.PollPolicy`：图片 1s 起、2s 间隔 | 声明 `poll.policy = {intervalSeconds:2,timeoutSeconds:1800}`；当前宿主仍按内置的 2.5s 间隔跑，未读该字段 |\n| history 空对象 | Go 判 `len(payload)==0` 继续等待 | `{\"$eq\":[{\"$len\":<条目>},0]}` → 状态机映射成 `queued` |\n| 产物 | 遍历 `outputs` 下**所有**节点 id 的 `images/gifs/videos/audio`，节点号按数值序稳定排列 | `outputs` 是动态键对象，表达式语言没有「取 map 全部值」的算子，只能读声明的单个 `outputNodeId` |\n| 失败信息 | 汇总所有 `status.messages`，用 `；` 连接，带节点号 | 取第一条 `execution_error`/`execution_interrupted`，同样带节点号 |\n| 中断判定 | `execution_interrupted` 判为已取消 | 同一判据，映射为 `cancelled` |\n| 取消对账 | `GET /queue` + `GET /history` 四态判定 | 声明式协议没有取消查询端口，未表达；见缺口清单 |\n| 类型校正 | INT/FLOAT/BOOLEAN 按 `/object_info` 校正后再下发 | 图已经在宿主侧映射完成，本包不做任何类型校正（原样透传） |\n\n## 当前状态\n\n本包是**第二阶段的目标形态**。协议层的 `uploads[]`、`poll.policy`、`request.workflow`（形状 `{json, clientId}`）与 `$get` 已经进 `internal/protocol`，但**宿主的执行链还没消费它们**：`GenerationRequest.Workflow` 没有赋值点、预上传没有调用方、轮询间隔仍取内置策略。逐条依赖与表达不了的环节列在 [docs/interface.md](docs/interface.md) 末尾。在宿主把 `request.workflow` 填上、把 `uploads[]` 跑起来之前，本包不能切流，Go 实现仍是唯一执行路径。\n\n---\n\n# 本地 ComfyUI 接口字段\n\n## 协议身份\n\n- 插件 ID：`comfyui-local`。\n- Provider ID：`comfyui-workflow-image`。\n- 能力：`image`。\n- 默认 Base URL：`http://127.0.0.1:8188`。\n- 鉴权驱动：`none`（ComfyUI 原生接口没有鉴权，宿主不为该渠道注入任何凭据头）。\n- 创建：`POST /prompt`。\n- 查询：`GET /history/{{taskId}}`。\n- 结果：`GET /view`（由响应映射拼成绝对地址，不声明独立结果端点）。\n- 取消：`POST /queue`，随后 `cancelOperations` 补发 `POST /interrupt`。\n\n所有端点都声明 `originPath: true`：ComfyUI 的原生接口全部挂在服务根路径下，而用户填写的 Base URL 可能带反向代理前缀。`originPath` 让声明的路径替换掉 Base URL 的路径段，只保留协议、主机和端口。\n\n## 前置条件与 SSRF\n\nBeefTV 默认拒绝本机、私网和链路本地上游。渠道指向 `127.0.0.1:8188` 时，部署环境必须**按主机名精确放行**：\n\n```bash\nCANVAS_ALLOWED_PRIVATE_UPSTREAM_HOSTS=127.0.0.1\n```\n\n局域网或反代场景同样只放行那一个主机名，多个用逗号分隔。不要设置「允许全部私网」来绕过 SSRF 防护：声明式渠道同样受出站校验保护，绕过它等于把内网任意端口暴露成可被模型渠道驱动的出口。\n\n## 配置字段\n\n无。`configuration.fields` 是空数组——ComfyUI 原生协议没有 API Key，`auth.type` 为 `none`。地址、工作流 JSON 和字段映射都来自渠道本身的配置，不由本包声明。\n\n## 统一字段映射\n\n| 字段 | 类型 | 必填 | 来源 | 用途 |\n| --- | --- | --- | --- | --- |\n| `request.workflow.json` | object | 是 | 宿主映射 | 已映射好的 API 格式工作流图，整体作为 `/prompt` 的 `prompt` 字段。 |\n| `request.workflow.clientId` | string | 否 | 宿主映射 | `/prompt` 的 `client_id`；未提供时省略该键。 |\n| `request.images[]` | media[] | 否 | 生成请求 | `uploads[]` 的迭代源，逐项预上传。 |\n| `request.providerOptions[\"comfyui-local\"].outputNodeId` | string | 否* | 渠道扩展 | 指明从 `outputs` 的哪个节点取产物。*image 链路实际必需。 |\n\n工作流节点内的业务参数（提示词、`KSampler.steps/sampler_name/scheduler/cfg/denoise/seed`、`EmptyLatentImage.width/height/batch_size`、`LoadImage.image`）**不通过 manifest 声明**：字段映射本身仍是宿主职责，manifest 只描述「怎么把已映射好的图交给 `/prompt`」。本包 `parameters` 里列出这些名字，是为了让渠道配置与画布控件有可枚举的口径，`mapping` 一律写明是宿主映射目标。\n\n`steps`、`cfg`、`denoise`、`seed` 落到图里必须保持 JSON 数字与布尔类型：`/prompt` 按 `/object_info` 校验输入类型，INT/FLOAT 收到字符串会整张图 400 拒绝。这个类型校正发生在宿主映射，本包不做二次校正。\n\n## 上游请求模板逐字段清单\n\n### create\n\n| 位置 | 值 |\n| --- | --- |\n| `method` | `POST` |\n| `path` | `/prompt` |\n| `contentType` | `application/json` |\n| `originPath` | `true` |\n| `body.prompt` | `{\"$ref\":\"request.workflow.json\"}` |\n| `body.client_id` | `{\"$omitEmpty\":{\"$ref\":\"request.workflow.clientId\"}}` |\n\n`request.workflow.json` 缺失时 `$ref` 得到 nil，`prompt` 键会被整段丢弃；提交前的 `validations` 已先断言图非空，不会把空 body 发给上游。\n\n### uploads（预上传，图生图必需）\n\n| 位置 | 值 |\n| --- | --- |\n| `id` | `referenceImage` |\n| `foreach` | `{\"$ref\":\"request.images\"}` |\n| `operation.method` | `POST` |\n| `operation.path` | `/upload/image` |\n| `operation.contentType` | `multipart/form-data` |\n| `operation.originPath` | `true` |\n| `operation.files[0]` | `{\"name\":\"image\",\"source\":{\"$ref\":\"item.dataUrl\"},\"filename\":{\"$ref\":\"item.name\"}}` |\n| `operation.query` | `{\"type\":{\"$literal\":\"input\"},\"overwrite\":{\"$literal\":\"true\"}}` |\n| `capture` | `{\"name\":{\"$ref\":\"response.name\"},\"subfolder\":{\"$ref\":\"response.subfolder\"},\"type\":{\"$ref\":\"response.type\"}}` |\n\n逐项迭代 `request.images`，当前元素绑定为 `item`，位置绑定为 `index`。`capture` 的三个字段在 `create`/`poll`/`result` 的求值环境里以 `uploads.referenceImage` 暴露，是**与输入顺序对齐的数组**。\n\n> 传参位置差异：Go 实现把 `type=input`、`overwrite=true` 写成 multipart **表单字段**，本包按既定契约写成 **查询参数**。两者是同一接口的不同传参位置，切流前必须真机复核上游读取哪一侧。\n\n### poll\n\n| 位置 | 值 |\n| --- | --- |\n| `method` / `path` | `GET` / `/history/{{taskId}}` |\n| `contentType` | `application/json` |\n| `originPath` | `true` |\n| `policy` | `{\"intervalSeconds\":2,\"timeoutSeconds\":1800}` |\n\n### cancel 与 cancelOperations\n\n| 顺序 | 端点 | body |\n| --- | --- | --- |\n| `cancel` | `POST /queue` | `{\"delete\":[{\"$ref\":\"taskId\"}]}` |\n| `cancelOperations[0]` | `POST /interrupt` | `{\"prompt_id\":{\"$ref\":\"taskId\"}}` |\n\n两段都发是刻意的：`/queue` 的 `delete` 只摘掉排队项、对执行中的任务无效；执行中的任务要 `/interrupt`。任务已结束时两者都不产生副作用，因此不需要先查状态。`/interrupt` 必须显式带 `prompt_id`——缺该字段会**全局中断**，在共享实例上会误伤他人任务。\n\n本包**不声明 `result` 端点**：宿主的 `BuildResult` 只能产出一个二进制请求，且其求值环境只有 `{request, taskId}`、没有 `response`，拿不到 `/view` 需要的 `filename`/`subfolder`/`type`，也无法一次取多张产物。结果一律通过 `response.images` 给出绝对地址，由宿主逐条下载持久化。\n\n## Provider 扩展键\n\n- `providerOptions.comfyui-local.outputNodeId`\n\n`client_id` 不属于扩展键，它随 `request.workflow.clientId` 由宿主下发。\n\n## 响应映射逐字段清单\n\n| 位置 | 声明 |\n| --- | --- |\n| `taskIdPaths` | `[\"prompt_id\"]`（取 `/prompt` 的同步响应） |\n| `resultKind` / `resultEphemeral` | `image` / `true` |\n| `status` | `$switch` 状态机，见下 |\n| `message` | `$map` 第一条 `execution_error`/`execution_interrupted` 消息，带节点号 |\n| `images` | `$map` 产物 → `{\"$ref\":\"baseUrl\"}` 拼绝对 `/view` 地址 |\n\n未声明 `errorPaths`：`/history` 的失败信息在 `{{taskId}}` 这个运行时顶层键之下，静态点分路径无法定位，失败语义完全由 `status` 状态机承担。\n\n状态机按顺序判定，解决 `/history` 的几种响应形态：\n\n| 上游形态 | 判定表达式 | 映射状态 |\n| --- | --- | --- |\n| 空对象 `{}` 或无本任务条目 | `{\"$eq\":[{\"$len\":<条目>},0]}` | `queued` → 继续轮询，**不算失败** |\n| `status.messages` 含 `execution_interrupted` | `$filter` 命中数 > 0 | `cancelled` |\n| `status.status_str == \"error\"` | `$lower/$trim/$toString` 后比较 | `failed` |\n| `status.completed == true` | `$toBool` | `succeeded` |\n| `outputs[<节点>]` 条目非空（该节点有任意输出键） | `$len` > 0 | `succeeded` |\n| 条目已出现但未执行完 | 默认分支 | `executing` |\n\n`$len` 对 map 返回键数，因此「history 里还没有本任务条目」可以判成排队中，而不是被当成空结果失败；被 `/interrupt` 结束的任务同样写入 history 且 `status_str` 为 `error`，只能靠 `execution_interrupted` 消息与真正的执行失败区分。\n\n最后一条兜底用 `$len(outputs[<节点>]) > 0` 而不是只数 `images`：`SaveAnimatedWEBP`/`SaveVideo` 把结果写在 `gifs`/`videos`/`audio` 下，只认 `images` 会让这类工作流停在 `executing` 直到超时。代价是节点条目形如 `{\"images\": []}` 时也会判成 `succeeded`，此时产物为空，宿主以「声明式协议已完成但没有返回媒体地址」失败——与 Go 的「ComfyUI 任务完成但没有返回产物」同一类终态，不会静默产出空素材。\n\n取产物时，`outputs` 的顶层键是节点 id（动态），必须先用 `$get` 按 `taskId` 取条目、再取 `outputs`、再按声明的 `outputNodeId` 取节点，最后读 `images`/`gifs`/`videos`/`audio` 四种键并用 `$concatArrays` 合并。每个文件拼成：\n\n```text\n{baseUrl}/view?filename={urlencode filename}&subfolder={urlencode subfolder}&type={urlencode (type ?? output)}\n```\n\n`$urlencode` 与 Go 的 `url.Values.Encode()` 逐字节一致（空格转 `+`，`#`、`%`、`&`、`/` 全部转义），`subfolder` 含 `/` 或空格时不能被当路径分段处理；`subfolder` 缺失时编码成空串，与 Go 的 `query.Set(\"subfolder\",\"\")` 行为一致。缺 `filename` 的条目由 `$if` 丢弃，避免拼出 `/view?filename=` 这种伪地址。\n\n`resultEphemeral: true`：`/view` 是本机地址，换端口或换设备即失效，宿主必须在成功后立即下载并持久化成素材，不把本机地址留在结果里。\n\n## 与 Go 实现的差异\n\n| 环节 | Go（`provider/workflow/comfyui.go`） | 本包 |\n| --- | --- | --- |\n| 提交 | `POST /prompt`，`client_id` 由宿主随机生成 16 字节 hex | `client_id` 取 `request.workflow.clientId`，缺省即省略；声明式表达式没有随机数算子 |\n| 参考图 | 走受保护素材端口读本机字节 → multipart 表单字段 `type`/`overwrite` | `uploads[]` 用 `item.dataUrl` 与查询参数 `type`/`overwrite` |\n| 回填 LoadImage | `buildComfyUIPromptBody` 按 `WorkflowFields` + `files[media.ID]` 写入节点 | **表达不了**，见下节 |\n| 轮询 | `workflow.PollPolicy`（图片 1s 起、2s 间隔） | 声明 `poll.policy` 2s/1800s，当前宿主仍用内置 2.5s |\n| 产物枚举 | 遍历 `outputs` 下所有节点 id，`images/gifs/videos/audio` 都收，节点号按数值序稳定排列 | 只能读声明的单个 `outputNodeId` |\n| 失败信息 | 汇总所有 `status.messages`，用 `；` 连接，带节点号 | 取第一条，同样带节点号 |\n| 取消 | `CancelComfyUI` 两步 + `QueryComfyUICancellation` 四态对账 | 两步声明；**取消对账没有声明端口** |\n| 400 校验错误 | 解析 `error`/`node_errors` 拼成中文消息 | 由宿主统一处理 HTTP 400 与响应体，不在 manifest 内 |\n| 类型校正 | 按 `/object_info` 把 INT/FLOAT/BOOLEAN 校正后再下发 | 图已由宿主映射完成，本包原样透传 |\n\n## 宿主必须保留的接缝（表达不了的环节）\n\n以下不是实现偷懒，而是当前契约表达不出来，必须留在宿主：\n\n1. **多张参考图回填进图**。`uploads[].capture` 只把 `name`/`subfolder`/`type` 放进求值环境；把第 i 项写进第 i 个 `LoadImage` 节点的 `inputs.image`，需要「按运行时路径写回 `request.workflow.json`」的算子，而当前操作符全部是**只读取**，没有 `$set`/`$setPath`，也没有按 index 生成动态键写回嵌套对象的手段。ComfyUI 还要求 `image` 值写成 `subfolder/name`（subfolder 为空时就是 `name`），这层拼接同样只能在宿主映射时完成。因此预上传步骤与字段映射必须**交错**在宿主侧执行，manifest 只能声明「上传这件事的形状」。\n2. **枚举 `outputs` 的全部节点**。`outputs` 的键是节点 id，没有「取 map 所有值」的算子（`$map`/`$filter` 的 `from` 遇到 map 只当单个元素处理，`$at`/`$first` 同样不展开 map）。所以只能读声明的单个 `outputNodeId`；多个 `SaveImage` 节点会漏产物，未声明时取不到结果。\n3. **取消对账**。`cancel`/`cancelOperations` 只表达「发哪些请求」。Go 的 `QueryComfyUICancellation` 用 `GET /queue` + `GET /history` 判 `pending/confirmed/succeeded/failed` 四态，声明式协议没有取消查询端口。\n4. **`/prompt` 400 的节点级错误文本**。`validations[].assert` 只在提交**前**求值且只看得见 `request`；`errorPaths`/`messagePaths` 是静态点分路径，无法定位 `{{taskId}}` 之下的响应。宿主若直接把 HTTP 400 正文交出去，会丢掉 Go 版本里「哪个节点的哪个输入不合法」这一层。\n5. **随机 `client_id`**。无随机/UUID 算子，必须由宿主在 `request.workflow.clientId` 里给。\n6. **数字键工作流图被误判成数组**。宿主会把请求体里的 map 递归规范化，若某份工作流的节点 id 恰为 `\"0\"`、`\"1\"`、`\"2\"`…连续序列，会被判成数组而破坏图结构。ComfyUI 导出的节点 id 通常从 `1` 开始，因此实际很少触发，但这是宿主行为，manifest 无法约束。\n\n## 契约依赖状态\n\n| 声明 | 状态 |\n| --- | --- |\n| `$urlencode`、`$lookup`、`$map`/`$filter`/`$first`/`$concat`/`$concatArrays`/`$merge`/`$if`/`$switch`/`$omitEmpty`/`$coalesce`/`$len`/`$at`/`$literal` | **现在就合法**，`internal/protocol/expression.go` 已实现 |\n| `cancelOperations`、`originPath`、`validations[].assert`、`response.taskIdPaths` | **现在就合法**，`ManifestProvider`/`ManifestOperation` 已有对应 json tag |\n| 响应环境 `baseUrl` | **现在就合法**，`manifestAdapter.parse` 已注入 |\n| `$get` | 已落到 `expression.go`（`case \"$get\"`），本包 `status`/`message`/`images` 依赖它 |\n| `providers[].uploads[]`（`foreach`/`capture`，环境键 `uploads.<id>`） | `ManifestUpload` 类型与 `newManifestUploadValues` 已在 `internal/protocol`，但**宿主执行链尚未消费**：`internal/generation` 里没有调用预上传的地方，图生图预上传目前不生效 |\n| `poll.policy` | `ManifestOperation.Policy` 字段已存在，宿主仍按 `DeclarativeProtocolPollPolicy` 的内置 2.5s 间隔轮询，未读声明值 |\n| `request.workflow.json` / `request.workflow.clientId` | `WorkflowPayload{json, clientId}` 与 `manifestRequestValues` 的 `workflow` 键已就位，但**还没有把映射好的图填入 `GenerationRequest.Workflow` 的写入点**，取到的是 nil |\n| 多节点产物枚举、按 index 回填 `LoadImage`、取消对账 | 契约里**没有**对应键，需要新增操作符或新增端口声明，不能靠现有语法硬凑 |\n\n也就是说：本包能过 JSON 与字段名校验，`$get` 也已可用，但真正跑通还差三处宿主接线（填充 `request.workflow`、执行 `uploads[]`、消费 `poll.policy`），以及上面列出的表达力缺口。切流必须排在最后。\n\n## 兼容边界\n\n只覆盖已在真机验收过的三段链路：文生图、图生图（参考图）、取消。不支持视频与音频参考、蒙版（`validations` 显式拒绝而不是静默丢弃素材）、WebSocket 进度、队列管理与 `/object_info` 拉取。上游要求六个根路径端点：`POST /prompt`、`GET /history/{prompt_id}`、`GET /view`、`POST /upload/image`、`POST /queue`、`POST /interrupt`。工作流必须是 API 格式而非 UI 导出。\n\n<!-- BEEFTV_PLUGIN_MANIFEST_START -->\n## Manifest 完整接口定义\n\n以下 JSON 与插件包内实际 `manifest.json` 逐字段一致，覆盖插件身份、权限、配置、鉴权、参数、校验、创建、Agent、查询、取消、结果下载、响应和 Agent 响应映射。`documentation` 字段的值就是当前完整文档；为避免文档在自身内部无限递归，JSON 中仅用等义占位文本表示正文。\n\n```json\n{\n  \"apiVersion\": \"beeftv.plugin/v2\",\n  \"id\": \"comfyui-local\",\n  \"name\": \"本地 ComfyUI（原生协议）\",\n  \"version\": \"2.0.0\",\n  \"author\": \"BeefTV Contributors\",\n  \"description\": \"本机 ComfyUI 原生 /prompt、/history、/view、/upload/image、/queue 与 /interrupt 协议的声明式插件。\",\n  \"documentation\": \"<当前插件的完整 documentation，由 README.md 与 docs/interface.md 拼接而成；为避免 JSON 递归，此处不重复展开正文。>\",\n  \"permissions\": [\n    \"generation.run\",\n    \"media.read\"\n  ],\n  \"configuration\": {\n    \"fields\": []\n  },\n  \"contributes\": {\n    \"providers\": [\n      {\n        \"id\": \"comfyui-workflow-image\",\n        \"label\": \"本地 ComfyUI（原生协议）\",\n        \"capabilities\": [\n          \"image\"\n        ],\n        \"scopes\": [\n          \"admin.system-channel\",\n          \"user.custom-channel\",\n          \"canvas\",\n          \"creation\"\n        ],\n        \"baseUrl\": \"http://127.0.0.1:8188\",\n        \"requiresPublicMediaUrls\": false,\n        \"auth\": {\n          \"type\": \"none\"\n        },\n        \"parameters\": [\n          {\n            \"name\": \"model\",\n            \"type\": \"string\",\n            \"required\": true,\n            \"mapping\": \"不进请求体\",\n            \"description\": \"工作流标识：宿主据此挑选要映射的 API 格式工作流。ComfyUI 的 /prompt 不接受模型名，模型本身写在图里的 CheckpointLoaderSimple 等节点上。\"\n          },\n          {\n            \"name\": \"workflow\",\n            \"type\": \"object\",\n            \"required\": true,\n            \"mapping\": \"create.body.prompt（取 request.workflow.json）\",\n            \"description\": \"宿主按字段映射写好之后的完整 API 格式图对象，经 request.workflow.json 下发；同批的 request.workflow.clientId 作为可选的 create.body.client_id。本包原样交给 /prompt，不解析也不改写任何节点。\"\n          },\n          {\n            \"name\": \"prompt\",\n            \"type\": \"string\",\n            \"mapping\": \"工作流内 CLIPTextEncode.text（宿主映射）\",\n            \"description\": \"正向提示词。由宿主写入图内的文本编码节点，不出现在 /prompt 请求体顶层。\"\n          },\n          {\n            \"name\": \"images\",\n            \"type\": \"media[]\",\n            \"mapping\": \"uploads[referenceImage] 与 工作流内 LoadImage.image（宿主回填）\",\n            \"description\": \"图生图的参考图。先由 uploads[] 预上传到 ComfyUI 的 input 目录，文件名按输入顺序回填进图里的 LoadImage 节点；回填本身属于宿主映射。\"\n          },\n          {\n            \"name\": \"resolution\",\n            \"type\": \"string\",\n            \"mapping\": \"工作流内 EmptyLatentImage.width/height（宿主映射）\",\n            \"description\": \"输出分辨率档位或 WxH 尺寸，由宿主拆成宽高写入图内。\"\n          },\n          {\n            \"name\": \"aspectRatio\",\n            \"type\": \"string\",\n            \"mapping\": \"工作流内 EmptyLatentImage.width/height（宿主映射）\",\n            \"description\": \"画面比例，由宿主换算成宽高后写入图内。\"\n          },\n          {\n            \"name\": \"imageCount\",\n            \"type\": \"integer\",\n            \"mapping\": \"工作流内 EmptyLatentImage.batch_size（宿主映射）\",\n            \"description\": \"单次提交张数，映射为 latent 批大小。\"\n          },\n          {\n            \"name\": \"steps\",\n            \"type\": \"integer\",\n            \"mapping\": \"工作流内 KSampler.steps（宿主映射）\",\n            \"description\": \"采样步数。必须写成 JSON 数字：/prompt 会按 /object_info 声明的类型校验，INT 收到字符串会整张图被 400 拒绝。\"\n          },\n          {\n            \"name\": \"samplerName\",\n            \"type\": \"string\",\n            \"mapping\": \"工作流内 KSampler.sampler_name（宿主映射）\",\n            \"values\": [\n              \"euler\",\n              \"euler_a\",\n              \"heun\",\n              \"dpm_2\",\n              \"dpm_2_a\",\n              \"dpm_fast\",\n              \"dpm_adaptive\",\n              \"dpmpp_2s_a\",\n              \"dpmpp_2m\",\n              \"dpmpp_sde\",\n              \"dpmpp_2m_sde\",\n              \"dpmpp_3m_sde\",\n              \"ddim\",\n              \"uni_pc\",\n              \"lms\"\n            ],\n            \"description\": \"采样器。可选值以该实例的 /object_info 为准，本表只是常见内置项。\"\n          },\n          {\n            \"name\": \"scheduler\",\n            \"type\": \"string\",\n            \"mapping\": \"工作流内 KSampler.scheduler（宿主映射）\",\n            \"values\": [\n              \"simple\",\n              \"karras\",\n              \"exponential\",\n              \"sgm_uniform\",\n              \"normal\",\n              \"ddpm_uniform\"\n            ],\n            \"description\": \"噪声调度器。与 samplerName 组合决定采样行为，同样以 /object_info 为准。\"\n          },\n          {\n            \"name\": \"cfg\",\n            \"type\": \"number\",\n            \"mapping\": \"工作流内 KSampler.cfg（宿主映射）\",\n            \"description\": \"提示词引导强度，FLOAT 类型，必须保持数字。\"\n          },\n          {\n            \"name\": \"denoise\",\n            \"type\": \"number\",\n            \"mapping\": \"工作流内 KSampler.denoise（宿主映射）\",\n            \"description\": \"重绘幅度，0~1 的 FLOAT。图生图关键参数：0 完全不改变参考图，1 完全重画。\"\n          },\n          {\n            \"name\": \"seed\",\n            \"type\": \"integer\",\n            \"mapping\": \"工作流内 KSampler.seed（宿主映射）\",\n            \"description\": \"随机种子。宿主随机取值上限是 2^53-1（JavaScript 安全整数），ComfyUI 声明的 uint64 上限不能直接用。\"\n          },\n          {\n            \"name\": \"providerOptions\",\n            \"type\": \"object\",\n            \"mapping\": \"provider-specific fields\",\n            \"description\": \"插件命名空间 comfyui-local 内的扩展字段：outputNodeId（读取产物用的节点 id）。client_id 不在这里，它随 request.workflow.clientId 由宿主下发。\"\n          }\n        ],\n        \"validations\": [\n          {\n            \"assert\": {\n              \"$gt\": [\n                {\n                  \"$len\": {\n                    \"$ref\": \"request.workflow.json\"\n                  }\n                },\n                0\n              ]\n            },\n            \"message\": \"ComfyUI 缺少已映射的工作流图：请先在渠道里粘贴 API 格式工作流并配置字段映射\"\n          },\n          {\n            \"assert\": {\n              \"$or\": [\n                {\n                  \"$eq\": [\n                    {\n                      \"$ref\": \"request.capability\"\n                    },\n                    \"image\"\n                  ]\n                },\n                {\n                  \"$eq\": [\n                    {\n                      \"$ref\": \"request.capability\"\n                    },\n                    \"\"\n                  ]\n                }\n              ]\n            },\n            \"message\": \"本地 ComfyUI 渠道只声明了 image 能力，请用图片生成模式提交\"\n          },\n          {\n            \"assert\": {\n              \"$and\": [\n                {\n                  \"$eq\": [\n                    {\n                      \"$len\": {\n                        \"$ref\": \"request.videos\"\n                      }\n                    },\n                    0\n                  ]\n                },\n                {\n                  \"$eq\": [\n                    {\n                      \"$len\": {\n                        \"$ref\": \"request.audios\"\n                      }\n                    },\n                    0\n                  ]\n                },\n                {\n                  \"$eq\": [\n                    {\n                      \"$len\": {\n                        \"$filter\": {\n                          \"from\": {\n                            \"$ref\": \"request.images\"\n                          },\n                          \"as\": \"media\",\n                          \"where\": {\n                            \"$in\": [\n                              {\n                                \"$lower\": {\n                                  \"$toString\": {\n                                    \"$ref\": \"media.role\"\n                                  }\n                                }\n                              },\n                              [\n                                \"mask\",\n                                \"inpaint_mask\",\n                                \"video\",\n                                \"audio\"\n                              ]\n                            ]\n                          }\n                        }\n                      }\n                    },\n                    0\n                  ]\n                }\n              ]\n            },\n            \"message\": \"ComfyUI 暂不支持视频、音频参考素材与蒙版\"\n          }\n        ],\n        \"uploads\": [\n          {\n            \"id\": \"referenceImage\",\n            \"foreach\": {\n              \"$ref\": \"request.images\"\n            },\n            \"operation\": {\n              \"method\": \"POST\",\n              \"path\": \"/upload/image\",\n              \"contentType\": \"multipart/form-data\",\n              \"originPath\": true,\n              \"files\": [\n                {\n                  \"name\": \"image\",\n                  \"source\": {\n                    \"$ref\": \"item.dataUrl\"\n                  },\n                  \"filename\": {\n                    \"$ref\": \"item.name\"\n                  }\n                }\n              ],\n              \"query\": {\n                \"type\": {\n                  \"$literal\": \"input\"\n                },\n                \"overwrite\": {\n                  \"$literal\": \"true\"\n                }\n              }\n            },\n            \"capture\": {\n              \"name\": {\n                \"$ref\": \"response.name\"\n              },\n              \"subfolder\": {\n                \"$ref\": \"response.subfolder\"\n              },\n              \"type\": {\n                \"$ref\": \"response.type\"\n              }\n            }\n          }\n        ],\n        \"create\": {\n          \"method\": \"POST\",\n          \"path\": \"/prompt\",\n          \"contentType\": \"application/json\",\n          \"originPath\": true,\n          \"body\": {\n            \"prompt\": {\n              \"$ref\": \"request.workflow.json\"\n            },\n            \"client_id\": {\n              \"$omitEmpty\": {\n                \"$ref\": \"request.workflow.clientId\"\n              }\n            }\n          }\n        },\n        \"poll\": {\n          \"method\": \"GET\",\n          \"path\": \"/history/{{taskId}}\",\n          \"contentType\": \"application/json\",\n          \"originPath\": true,\n          \"policy\": {\n            \"intervalSeconds\": 2,\n            \"timeoutSeconds\": 1800\n          }\n        },\n        \"cancel\": {\n          \"method\": \"POST\",\n          \"path\": \"/queue\",\n          \"contentType\": \"application/json\",\n          \"originPath\": true,\n          \"body\": {\n            \"delete\": [\n              {\n                \"$ref\": \"taskId\"\n              }\n            ]\n          }\n        },\n        \"cancelOperations\": [\n          {\n            \"method\": \"POST\",\n            \"path\": \"/interrupt\",\n            \"contentType\": \"application/json\",\n            \"originPath\": true,\n            \"body\": {\n              \"prompt_id\": {\n                \"$ref\": \"taskId\"\n              }\n            }\n          }\n        ],\n        \"response\": {\n          \"taskIdPaths\": [\n            \"prompt_id\"\n          ],\n          \"resultKind\": \"image\",\n          \"resultEphemeral\": true,\n          \"status\": {\n            \"$switch\": {\n              \"cases\": [\n                {\n                  \"when\": {\n                    \"$eq\": [\n                      {\n                        \"$len\": {\n                          \"$get\": [\n                            {\n                              \"$ref\": \"response\"\n                            },\n                            {\n                              \"$ref\": \"taskId\"\n                            }\n                          ]\n                        }\n                      },\n                      0\n                    ]\n                  },\n                  \"then\": \"queued\"\n                },\n                {\n                  \"when\": {\n                    \"$gt\": [\n                      {\n                        \"$len\": {\n                          \"$filter\": {\n                            \"from\": {\n                              \"$get\": [\n                                {\n                                  \"$get\": [\n                                    {\n                                      \"$get\": [\n                                        {\n                                          \"$ref\": \"response\"\n                                        },\n                                        {\n                                          \"$ref\": \"taskId\"\n                                        }\n                                      ]\n                                    },\n                                    {\n                                      \"$literal\": \"status\"\n                                    }\n                                  ]\n                                },\n                                {\n                                  \"$literal\": \"messages\"\n                                }\n                              ]\n                            },\n                            \"as\": \"message\",\n                            \"where\": {\n                              \"$eq\": [\n                                {\n                                  \"$lower\": {\n                                    \"$toString\": {\n                                      \"$ref\": \"message.0\"\n                                    }\n                                  }\n                                },\n                                \"execution_interrupted\"\n                              ]\n                            }\n                          }\n                        }\n                      },\n                      0\n                    ]\n                  },\n                  \"then\": \"cancelled\"\n                },\n                {\n                  \"when\": {\n                    \"$eq\": [\n                      {\n                        \"$lower\": {\n                          \"$trim\": {\n                            \"$toString\": {\n                              \"$get\": [\n                                {\n                                  \"$get\": [\n                                    {\n                                      \"$get\": [\n                                        {\n                                          \"$ref\": \"response\"\n                                        },\n                                        {\n                                          \"$ref\": \"taskId\"\n                                        }\n                                      ]\n                                    },\n                                    {\n                                      \"$literal\": \"status\"\n                                    }\n                                  ]\n                                },\n                                {\n                                  \"$literal\": \"status_str\"\n                                }\n                              ]\n                            }\n                          }\n                        }\n                      },\n                      \"error\"\n                    ]\n                  },\n                  \"then\": \"failed\"\n                },\n                {\n                  \"when\": {\n                    \"$toBool\": {\n                      \"$get\": [\n                        {\n                          \"$get\": [\n                            {\n                              \"$get\": [\n                                {\n                                  \"$ref\": \"response\"\n                                },\n                                {\n                                  \"$ref\": \"taskId\"\n                                }\n                              ]\n                            },\n                            {\n                              \"$literal\": \"status\"\n                            }\n                          ]\n                        },\n                        {\n                          \"$literal\": \"completed\"\n                        }\n                      ]\n                    }\n                  },\n                  \"then\": \"succeeded\"\n                },\n                {\n                  \"when\": {\n                    \"$gt\": [\n                      {\n                        \"$len\": {\n                          \"$get\": [\n                            {\n                              \"$get\": [\n                                {\n                                  \"$get\": [\n                                    {\n                                      \"$ref\": \"response\"\n                                    },\n                                    {\n                                      \"$ref\": \"taskId\"\n                                    }\n                                  ]\n                                },\n                                {\n                                  \"$literal\": \"outputs\"\n                                }\n                              ]\n                            },\n                            {\n                              \"$ref\": \"request.providerOptions.comfyui-local.outputNodeId\"\n                            }\n                          ]\n                        }\n                      },\n                      0\n                    ]\n                  },\n                  \"then\": \"succeeded\"\n                }\n              ],\n              \"default\": \"executing\"\n            }\n          },\n          \"message\": {\n            \"$omitEmpty\": {\n              \"$first\": {\n                \"$map\": {\n                  \"from\": {\n                    \"$filter\": {\n                      \"from\": {\n                        \"$get\": [\n                          {\n                            \"$get\": [\n                              {\n                                \"$get\": [\n                                  {\n                                    \"$ref\": \"response\"\n                                  },\n                                  {\n                                    \"$ref\": \"taskId\"\n                                  }\n                                ]\n                              },\n                              {\n                                \"$literal\": \"status\"\n                              }\n                            ]\n                          },\n                          {\n                            \"$literal\": \"messages\"\n                          }\n                        ]\n                      },\n                      \"as\": \"message\",\n                      \"where\": {\n                        \"$in\": [\n                          {\n                            \"$lower\": {\n                              \"$toString\": {\n                                \"$ref\": \"message.0\"\n                              }\n                            }\n                          },\n                          [\n                            \"execution_error\",\n                            \"execution_interrupted\"\n                          ]\n                        ]\n                      }\n                    }\n                  },\n                  \"as\": \"message\",\n                  \"in\": {\n                    \"$concat\": [\n                      {\n                        \"$if\": {\n                          \"condition\": {\n                            \"$ne\": [\n                              {\n                                \"$get\": [\n                                  {\n                                    \"$ref\": \"message.1\"\n                                  },\n                                  {\n                                    \"$literal\": \"node_id\"\n                                  }\n                                ]\n                              },\n                              null\n                            ]\n                          },\n                          \"then\": {\n                            \"$concat\": [\n                              \"节点 \",\n                              {\n                                \"$get\": [\n                                  {\n                                    \"$ref\": \"message.1\"\n                                  },\n                                  {\n                                    \"$literal\": \"node_id\"\n                                  }\n                                ]\n                              },\n                              \"：\"\n                            ]\n                          },\n                          \"else\": null\n                        }\n                      },\n                      {\n                        \"$coalesce\": [\n                          {\n                            \"$get\": [\n                              {\n                                \"$ref\": \"message.1\"\n                              },\n                              {\n                                \"$literal\": \"exception_message\"\n                              }\n                            ]\n                          },\n                          {\n                            \"$get\": [\n                              {\n                                \"$ref\": \"message.1\"\n                              },\n                              {\n                                \"$literal\": \"exception_type\"\n                              }\n                            ]\n                          },\n                          {\n                            \"$if\": {\n                              \"condition\": {\n                                \"$eq\": [\n                                  {\n                                    \"$lower\": {\n                                      \"$toString\": {\n                                        \"$ref\": \"message.0\"\n                                      }\n                                    }\n                                  },\n                                  \"execution_interrupted\"\n                                ]\n                              },\n                              \"then\": \"任务已被中断\",\n                              \"else\": null\n                            }\n                          },\n                          {\n                            \"$literal\": \"ComfyUI 执行失败\"\n                          }\n                        ]\n                      }\n                    ]\n                  }\n                }\n              }\n            }\n          },\n          \"images\": {\n            \"$map\": {\n              \"from\": {\n                \"$concatArrays\": [\n                  {\n                    \"$get\": [\n                      {\n                        \"$get\": [\n                          {\n                            \"$get\": [\n                              {\n                                \"$get\": [\n                                  {\n                                    \"$ref\": \"response\"\n                                  },\n                                  {\n                                    \"$ref\": \"taskId\"\n                                  }\n                                ]\n                              },\n                              {\n                                \"$literal\": \"outputs\"\n                              }\n                            ]\n                          },\n                          {\n                            \"$ref\": \"request.providerOptions.comfyui-local.outputNodeId\"\n                          }\n                        ]\n                      },\n                      {\n                        \"$literal\": \"images\"\n                      }\n                    ]\n                  },\n                  {\n                    \"$get\": [\n                      {\n                        \"$get\": [\n                          {\n                            \"$get\": [\n                              {\n                                \"$get\": [\n                                  {\n                                    \"$ref\": \"response\"\n                                  },\n                                  {\n                                    \"$ref\": \"taskId\"\n                                  }\n                                ]\n                              },\n                              {\n                                \"$literal\": \"outputs\"\n                              }\n                            ]\n                          },\n                          {\n                            \"$ref\": \"request.providerOptions.comfyui-local.outputNodeId\"\n                          }\n                        ]\n                      },\n                      {\n                        \"$literal\": \"gifs\"\n                      }\n                    ]\n                  },\n                  {\n                    \"$get\": [\n                      {\n                        \"$get\": [\n                          {\n                            \"$get\": [\n                              {\n                                \"$get\": [\n                                  {\n                                    \"$ref\": \"response\"\n                                  },\n                                  {\n                                    \"$ref\": \"taskId\"\n                                  }\n                                ]\n                              },\n                              {\n                                \"$literal\": \"outputs\"\n                              }\n                            ]\n                          },\n                          {\n                            \"$ref\": \"request.providerOptions.comfyui-local.outputNodeId\"\n                          }\n                        ]\n                      },\n                      {\n                        \"$literal\": \"videos\"\n                      }\n                    ]\n                  },\n                  {\n                    \"$get\": [\n                      {\n                        \"$get\": [\n                          {\n                            \"$get\": [\n                              {\n                                \"$get\": [\n                                  {\n                                    \"$ref\": \"response\"\n                                  },\n                                  {\n                                    \"$ref\": \"taskId\"\n                                  }\n                                ]\n                              },\n                              {\n                                \"$literal\": \"outputs\"\n                              }\n                            ]\n                          },\n                          {\n                            \"$ref\": \"request.providerOptions.comfyui-local.outputNodeId\"\n                          }\n                        ]\n                      },\n                      {\n                        \"$literal\": \"audio\"\n                      }\n                    ]\n                  }\n                ]\n              },\n              \"as\": \"file\",\n              \"in\": {\n                \"$if\": {\n                  \"condition\": {\n                    \"$ne\": [\n                      {\n                        \"$ref\": \"file.filename\"\n                      },\n                      null\n                    ]\n                  },\n                  \"then\": {\n                    \"url\": {\n                      \"$concat\": [\n                        {\n                          \"$ref\": \"baseUrl\"\n                        },\n                        \"/view?filename=\",\n                        {\n                          \"$urlencode\": {\n                            \"$ref\": \"file.filename\"\n                          }\n                        },\n                        \"&subfolder=\",\n                        {\n                          \"$urlencode\": {\n                            \"$ref\": \"file.subfolder\"\n                          }\n                        },\n                        \"&type=\",\n                        {\n                          \"$urlencode\": {\n                            \"$coalesce\": [\n                              {\n                                \"$ref\": \"file.type\"\n                              },\n                              {\n                                \"$literal\": \"output\"\n                              }\n                            ]\n                          }\n                        }\n                      ]\n                    },\n                    \"name\": {\n                      \"$omitEmpty\": {\n                        \"$ref\": \"file.filename\"\n                      }\n                    },\n                    \"kind\": \"image\"\n                  },\n                  \"else\": null\n                }\n              }\n            }\n          }\n        }\n      }\n    ]\n  }\n}\n```\n<!-- BEEFTV_PLUGIN_MANIFEST_END -->\n",
+  "permissions": [
+    "generation.run",
+    "media.read"
+  ],
+  "configuration": {
+    "fields": []
+  },
+  "contributes": {
+    "providers": [
+      {
+        "id": "comfyui-workflow-image",
+        "label": "本地 ComfyUI（原生协议）",
+        "capabilities": [
+          "image"
+        ],
+        "scopes": [
+          "admin.system-channel",
+          "user.custom-channel",
+          "canvas",
+          "creation"
+        ],
+        "baseUrl": "http://127.0.0.1:8188",
+        "requiresPublicMediaUrls": false,
+        "auth": {
+          "type": "none"
+        },
+        "parameters": [
+          {
+            "name": "model",
+            "type": "string",
+            "required": true,
+            "mapping": "不进请求体",
+            "description": "工作流标识：宿主据此挑选要映射的 API 格式工作流。ComfyUI 的 /prompt 不接受模型名，模型本身写在图里的 CheckpointLoaderSimple 等节点上。"
+          },
+          {
+            "name": "workflow",
+            "type": "object",
+            "required": true,
+            "mapping": "create.body.prompt（取 request.workflow.json）",
+            "description": "宿主按字段映射写好之后的完整 API 格式图对象，经 request.workflow.json 下发；同批的 request.workflow.clientId 作为可选的 create.body.client_id。本包原样交给 /prompt，不解析也不改写任何节点。"
+          },
+          {
+            "name": "prompt",
+            "type": "string",
+            "mapping": "工作流内 CLIPTextEncode.text（宿主映射）",
+            "description": "正向提示词。由宿主写入图内的文本编码节点，不出现在 /prompt 请求体顶层。"
+          },
+          {
+            "name": "images",
+            "type": "media[]",
+            "mapping": "uploads[referenceImage] 与 工作流内 LoadImage.image（宿主回填）",
+            "description": "图生图的参考图。先由 uploads[] 预上传到 ComfyUI 的 input 目录，文件名按输入顺序回填进图里的 LoadImage 节点；回填本身属于宿主映射。"
+          },
+          {
+            "name": "resolution",
+            "type": "string",
+            "mapping": "工作流内 EmptyLatentImage.width/height（宿主映射）",
+            "description": "输出分辨率档位或 WxH 尺寸，由宿主拆成宽高写入图内。"
+          },
+          {
+            "name": "aspectRatio",
+            "type": "string",
+            "mapping": "工作流内 EmptyLatentImage.width/height（宿主映射）",
+            "description": "画面比例，由宿主换算成宽高后写入图内。"
+          },
+          {
+            "name": "imageCount",
+            "type": "integer",
+            "mapping": "工作流内 EmptyLatentImage.batch_size（宿主映射）",
+            "description": "单次提交张数，映射为 latent 批大小。"
+          },
+          {
+            "name": "steps",
+            "type": "integer",
+            "mapping": "工作流内 KSampler.steps（宿主映射）",
+            "description": "采样步数。必须写成 JSON 数字：/prompt 会按 /object_info 声明的类型校验，INT 收到字符串会整张图被 400 拒绝。"
+          },
+          {
+            "name": "samplerName",
+            "type": "string",
+            "mapping": "工作流内 KSampler.sampler_name（宿主映射）",
+            "values": [
+              "euler",
+              "euler_a",
+              "heun",
+              "dpm_2",
+              "dpm_2_a",
+              "dpm_fast",
+              "dpm_adaptive",
+              "dpmpp_2s_a",
+              "dpmpp_2m",
+              "dpmpp_sde",
+              "dpmpp_2m_sde",
+              "dpmpp_3m_sde",
+              "ddim",
+              "uni_pc",
+              "lms"
+            ],
+            "description": "采样器。可选值以该实例的 /object_info 为准，本表只是常见内置项。"
+          },
+          {
+            "name": "scheduler",
+            "type": "string",
+            "mapping": "工作流内 KSampler.scheduler（宿主映射）",
+            "values": [
+              "simple",
+              "karras",
+              "exponential",
+              "sgm_uniform",
+              "normal",
+              "ddpm_uniform"
+            ],
+            "description": "噪声调度器。与 samplerName 组合决定采样行为，同样以 /object_info 为准。"
+          },
+          {
+            "name": "cfg",
+            "type": "number",
+            "mapping": "工作流内 KSampler.cfg（宿主映射）",
+            "description": "提示词引导强度，FLOAT 类型，必须保持数字。"
+          },
+          {
+            "name": "denoise",
+            "type": "number",
+            "mapping": "工作流内 KSampler.denoise（宿主映射）",
+            "description": "重绘幅度，0~1 的 FLOAT。图生图关键参数：0 完全不改变参考图，1 完全重画。"
+          },
+          {
+            "name": "seed",
+            "type": "integer",
+            "mapping": "工作流内 KSampler.seed（宿主映射）",
+            "description": "随机种子。宿主随机取值上限是 2^53-1（JavaScript 安全整数），ComfyUI 声明的 uint64 上限不能直接用。"
+          },
+          {
+            "name": "providerOptions",
+            "type": "object",
+            "mapping": "provider-specific fields",
+            "description": "插件命名空间 comfyui-local 内的扩展字段：outputNodeId（读取产物用的节点 id）。client_id 不在这里，它随 request.workflow.clientId 由宿主下发。"
+          }
+        ],
+        "validations": [
+          {
+            "assert": {
+              "$gt": [
+                {
+                  "$len": {
+                    "$ref": "request.workflow.json"
+                  }
+                },
+                0
+              ]
+            },
+            "message": "ComfyUI 缺少已映射的工作流图：请先在渠道里粘贴 API 格式工作流并配置字段映射"
+          },
+          {
+            "assert": {
+              "$or": [
+                {
+                  "$eq": [
+                    {
+                      "$ref": "request.capability"
+                    },
+                    "image"
+                  ]
+                },
+                {
+                  "$eq": [
+                    {
+                      "$ref": "request.capability"
+                    },
+                    ""
+                  ]
+                }
+              ]
+            },
+            "message": "本地 ComfyUI 渠道只声明了 image 能力，请用图片生成模式提交"
+          },
+          {
+            "assert": {
+              "$and": [
+                {
+                  "$eq": [
+                    {
+                      "$len": {
+                        "$ref": "request.videos"
+                      }
+                    },
+                    0
+                  ]
+                },
+                {
+                  "$eq": [
+                    {
+                      "$len": {
+                        "$ref": "request.audios"
+                      }
+                    },
+                    0
+                  ]
+                },
+                {
+                  "$eq": [
+                    {
+                      "$len": {
+                        "$filter": {
+                          "from": {
+                            "$ref": "request.images"
+                          },
+                          "as": "media",
+                          "where": {
+                            "$in": [
+                              {
+                                "$lower": {
+                                  "$toString": {
+                                    "$ref": "media.role"
+                                  }
+                                }
+                              },
+                              [
+                                "mask",
+                                "inpaint_mask",
+                                "video",
+                                "audio"
+                              ]
+                            ]
+                          }
+                        }
+                      }
+                    },
+                    0
+                  ]
+                }
+              ]
+            },
+            "message": "ComfyUI 暂不支持视频、音频参考素材与蒙版"
+          }
+        ],
+        "uploads": [
+          {
+            "id": "referenceImage",
+            "foreach": {
+              "$ref": "request.images"
+            },
+            "operation": {
+              "method": "POST",
+              "path": "/upload/image",
+              "contentType": "multipart/form-data",
+              "originPath": true,
+              "files": [
+                {
+                  "name": "image",
+                  "source": {
+                    "$ref": "item.dataUrl"
+                  },
+                  "filename": {
+                    "$ref": "item.name"
+                  }
+                }
+              ],
+              "query": {
+                "type": {
+                  "$literal": "input"
+                },
+                "overwrite": {
+                  "$literal": "true"
+                }
+              }
+            },
+            "capture": {
+              "name": {
+                "$ref": "response.name"
+              },
+              "subfolder": {
+                "$ref": "response.subfolder"
+              },
+              "type": {
+                "$ref": "response.type"
+              }
+            }
+          }
+        ],
+        "create": {
+          "method": "POST",
+          "path": "/prompt",
+          "contentType": "application/json",
+          "originPath": true,
+          "body": {
+            "prompt": {
+              "$ref": "request.workflow.json"
+            },
+            "client_id": {
+              "$omitEmpty": {
+                "$ref": "request.workflow.clientId"
+              }
+            }
+          }
+        },
+        "poll": {
+          "method": "GET",
+          "path": "/history/{{taskId}}",
+          "contentType": "application/json",
+          "originPath": true,
+          "policy": {
+            "intervalSeconds": 2,
+            "timeoutSeconds": 1800
+          }
+        },
+        "cancel": {
+          "method": "POST",
+          "path": "/queue",
+          "contentType": "application/json",
+          "originPath": true,
+          "body": {
+            "delete": [
+              {
+                "$ref": "taskId"
+              }
+            ]
+          }
+        },
+        "cancelOperations": [
+          {
+            "method": "POST",
+            "path": "/interrupt",
+            "contentType": "application/json",
+            "originPath": true,
+            "body": {
+              "prompt_id": {
+                "$ref": "taskId"
+              }
+            }
+          }
+        ],
+        "response": {
+          "taskIdPaths": [
+            "prompt_id"
+          ],
+          "resultKind": "image",
+          "resultEphemeral": true,
+          "status": {
+            "$switch": {
+              "cases": [
+                {
+                  "when": {
+                    "$eq": [
+                      {
+                        "$len": {
+                          "$get": [
+                            {
+                              "$ref": "response"
+                            },
+                            {
+                              "$ref": "taskId"
+                            }
+                          ]
+                        }
+                      },
+                      0
+                    ]
+                  },
+                  "then": "queued"
+                },
+                {
+                  "when": {
+                    "$gt": [
+                      {
+                        "$len": {
+                          "$filter": {
+                            "from": {
+                              "$get": [
+                                {
+                                  "$get": [
+                                    {
+                                      "$get": [
+                                        {
+                                          "$ref": "response"
+                                        },
+                                        {
+                                          "$ref": "taskId"
+                                        }
+                                      ]
+                                    },
+                                    {
+                                      "$literal": "status"
+                                    }
+                                  ]
+                                },
+                                {
+                                  "$literal": "messages"
+                                }
+                              ]
+                            },
+                            "as": "message",
+                            "where": {
+                              "$eq": [
+                                {
+                                  "$lower": {
+                                    "$toString": {
+                                      "$ref": "message.0"
+                                    }
+                                  }
+                                },
+                                "execution_interrupted"
+                              ]
+                            }
+                          }
+                        }
+                      },
+                      0
+                    ]
+                  },
+                  "then": "cancelled"
+                },
+                {
+                  "when": {
+                    "$eq": [
+                      {
+                        "$lower": {
+                          "$trim": {
+                            "$toString": {
+                              "$get": [
+                                {
+                                  "$get": [
+                                    {
+                                      "$get": [
+                                        {
+                                          "$ref": "response"
+                                        },
+                                        {
+                                          "$ref": "taskId"
+                                        }
+                                      ]
+                                    },
+                                    {
+                                      "$literal": "status"
+                                    }
+                                  ]
+                                },
+                                {
+                                  "$literal": "status_str"
+                                }
+                              ]
+                            }
+                          }
+                        }
+                      },
+                      "error"
+                    ]
+                  },
+                  "then": "failed"
+                },
+                {
+                  "when": {
+                    "$toBool": {
+                      "$get": [
+                        {
+                          "$get": [
+                            {
+                              "$get": [
+                                {
+                                  "$ref": "response"
+                                },
+                                {
+                                  "$ref": "taskId"
+                                }
+                              ]
+                            },
+                            {
+                              "$literal": "status"
+                            }
+                          ]
+                        },
+                        {
+                          "$literal": "completed"
+                        }
+                      ]
+                    }
+                  },
+                  "then": "succeeded"
+                },
+                {
+                  "when": {
+                    "$gt": [
+                      {
+                        "$len": {
+                          "$get": [
+                            {
+                              "$get": [
+                                {
+                                  "$get": [
+                                    {
+                                      "$ref": "response"
+                                    },
+                                    {
+                                      "$ref": "taskId"
+                                    }
+                                  ]
+                                },
+                                {
+                                  "$literal": "outputs"
+                                }
+                              ]
+                            },
+                            {
+                              "$ref": "request.providerOptions.comfyui-local.outputNodeId"
+                            }
+                          ]
+                        }
+                      },
+                      0
+                    ]
+                  },
+                  "then": "succeeded"
+                }
+              ],
+              "default": "executing"
+            }
+          },
+          "message": {
+            "$omitEmpty": {
+              "$first": {
+                "$map": {
+                  "from": {
+                    "$filter": {
+                      "from": {
+                        "$get": [
+                          {
+                            "$get": [
+                              {
+                                "$get": [
+                                  {
+                                    "$ref": "response"
+                                  },
+                                  {
+                                    "$ref": "taskId"
+                                  }
+                                ]
+                              },
+                              {
+                                "$literal": "status"
+                              }
+                            ]
+                          },
+                          {
+                            "$literal": "messages"
+                          }
+                        ]
+                      },
+                      "as": "message",
+                      "where": {
+                        "$in": [
+                          {
+                            "$lower": {
+                              "$toString": {
+                                "$ref": "message.0"
+                              }
+                            }
+                          },
+                          [
+                            "execution_error",
+                            "execution_interrupted"
+                          ]
+                        ]
+                      }
+                    }
+                  },
+                  "as": "message",
+                  "in": {
+                    "$concat": [
+                      {
+                        "$if": {
+                          "condition": {
+                            "$ne": [
+                              {
+                                "$get": [
+                                  {
+                                    "$ref": "message.1"
+                                  },
+                                  {
+                                    "$literal": "node_id"
+                                  }
+                                ]
+                              },
+                              null
+                            ]
+                          },
+                          "then": {
+                            "$concat": [
+                              "节点 ",
+                              {
+                                "$get": [
+                                  {
+                                    "$ref": "message.1"
+                                  },
+                                  {
+                                    "$literal": "node_id"
+                                  }
+                                ]
+                              },
+                              "："
+                            ]
+                          },
+                          "else": null
+                        }
+                      },
+                      {
+                        "$coalesce": [
+                          {
+                            "$get": [
+                              {
+                                "$ref": "message.1"
+                              },
+                              {
+                                "$literal": "exception_message"
+                              }
+                            ]
+                          },
+                          {
+                            "$get": [
+                              {
+                                "$ref": "message.1"
+                              },
+                              {
+                                "$literal": "exception_type"
+                              }
+                            ]
+                          },
+                          {
+                            "$if": {
+                              "condition": {
+                                "$eq": [
+                                  {
+                                    "$lower": {
+                                      "$toString": {
+                                        "$ref": "message.0"
+                                      }
+                                    }
+                                  },
+                                  "execution_interrupted"
+                                ]
+                              },
+                              "then": "任务已被中断",
+                              "else": null
+                            }
+                          },
+                          {
+                            "$literal": "ComfyUI 执行失败"
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          },
+          "images": {
+            "$map": {
+              "from": {
+                "$concatArrays": [
+                  {
+                    "$get": [
+                      {
+                        "$get": [
+                          {
+                            "$get": [
+                              {
+                                "$get": [
+                                  {
+                                    "$ref": "response"
+                                  },
+                                  {
+                                    "$ref": "taskId"
+                                  }
+                                ]
+                              },
+                              {
+                                "$literal": "outputs"
+                              }
+                            ]
+                          },
+                          {
+                            "$ref": "request.providerOptions.comfyui-local.outputNodeId"
+                          }
+                        ]
+                      },
+                      {
+                        "$literal": "images"
+                      }
+                    ]
+                  },
+                  {
+                    "$get": [
+                      {
+                        "$get": [
+                          {
+                            "$get": [
+                              {
+                                "$get": [
+                                  {
+                                    "$ref": "response"
+                                  },
+                                  {
+                                    "$ref": "taskId"
+                                  }
+                                ]
+                              },
+                              {
+                                "$literal": "outputs"
+                              }
+                            ]
+                          },
+                          {
+                            "$ref": "request.providerOptions.comfyui-local.outputNodeId"
+                          }
+                        ]
+                      },
+                      {
+                        "$literal": "gifs"
+                      }
+                    ]
+                  },
+                  {
+                    "$get": [
+                      {
+                        "$get": [
+                          {
+                            "$get": [
+                              {
+                                "$get": [
+                                  {
+                                    "$ref": "response"
+                                  },
+                                  {
+                                    "$ref": "taskId"
+                                  }
+                                ]
+                              },
+                              {
+                                "$literal": "outputs"
+                              }
+                            ]
+                          },
+                          {
+                            "$ref": "request.providerOptions.comfyui-local.outputNodeId"
+                          }
+                        ]
+                      },
+                      {
+                        "$literal": "videos"
+                      }
+                    ]
+                  },
+                  {
+                    "$get": [
+                      {
+                        "$get": [
+                          {
+                            "$get": [
+                              {
+                                "$get": [
+                                  {
+                                    "$ref": "response"
+                                  },
+                                  {
+                                    "$ref": "taskId"
+                                  }
+                                ]
+                              },
+                              {
+                                "$literal": "outputs"
+                              }
+                            ]
+                          },
+                          {
+                            "$ref": "request.providerOptions.comfyui-local.outputNodeId"
+                          }
+                        ]
+                      },
+                      {
+                        "$literal": "audio"
+                      }
+                    ]
+                  }
+                ]
+              },
+              "as": "file",
+              "in": {
+                "$if": {
+                  "condition": {
+                    "$ne": [
+                      {
+                        "$ref": "file.filename"
+                      },
+                      null
+                    ]
+                  },
+                  "then": {
+                    "url": {
+                      "$concat": [
+                        {
+                          "$ref": "baseUrl"
+                        },
+                        "/view?filename=",
+                        {
+                          "$urlencode": {
+                            "$ref": "file.filename"
+                          }
+                        },
+                        "&subfolder=",
+                        {
+                          "$urlencode": {
+                            "$ref": "file.subfolder"
+                          }
+                        },
+                        "&type=",
+                        {
+                          "$urlencode": {
+                            "$coalesce": [
+                              {
+                                "$ref": "file.type"
+                              },
+                              {
+                                "$literal": "output"
+                              }
+                            ]
+                          }
+                        }
+                      ]
+                    },
+                    "name": {
+                      "$omitEmpty": {
+                        "$ref": "file.filename"
+                      }
+                    },
+                    "kind": "image"
+                  },
+                  "else": null
+                }
+              }
+            }
+          }
+        }
+      }
+    ]
+  }
+}
