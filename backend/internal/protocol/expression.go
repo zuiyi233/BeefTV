@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -300,13 +301,44 @@ func evaluateManifestOperator(operator string, operand any, env map[string]any) 
 			}
 		}
 		return evaluateManifestValue(spec["default"], env)
+	case "$lookup":
+		// Static value translation table, e.g. a UI-facing option name that
+		// differs from the token the upstream payload expects. Table keys are
+		// compared against the stringified source; table values stay template
+		// nodes so they can reuse any other operator.
+		spec, ok := operand.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("$lookup requires an object")
+		}
+		source, err := evaluateManifestValue(spec["from"], env)
+		if err != nil {
+			return nil, err
+		}
+		var table map[string]any
+		if spec["map"] != nil {
+			table, ok = spec["map"].(map[string]any)
+			if !ok {
+				return nil, fmt.Errorf("$lookup map requires an object")
+			}
+		}
+		if entry, ok := table[manifestString(source)]; ok {
+			return evaluateManifestValue(entry, env)
+		}
+		// A miss is a data condition, not a malformed template, so it never
+		// errors: an explicit "default" node is evaluated (a literal null
+		// drops the field), and without one the source value passes through
+		// unchanged so unmapped tokens keep working without a table entry.
+		if fallback, ok := spec["default"]; ok {
+			return evaluateManifestValue(fallback, env)
+		}
+		return source, nil
 	case "$omitEmpty":
 		value, err := evaluateManifestValue(operand, env)
 		if err != nil || manifestEmpty(value) {
 			return nil, err
 		}
 		return value, nil
-	case "$lower", "$upper", "$trim", "$toString", "$toInt", "$toFloat", "$toBool", "$dataMime", "$dataPayload", "$json":
+	case "$lower", "$upper", "$trim", "$toString", "$toInt", "$toFloat", "$toBool", "$dataMime", "$dataPayload", "$urlencode", "$json":
 		value, err := evaluateManifestValue(operand, env)
 		if err != nil {
 			return nil, err
@@ -321,6 +353,13 @@ func evaluateManifestOperator(operator string, operand any, env map[string]any) 
 			return strings.TrimSpace(text), nil
 		case "$toString":
 			return text, nil
+		case "$urlencode":
+			// Query-parameter value encoding, matching the form encoding the
+			// upstream already emits for provider URLs: spaces become "+" and
+			// reserved characters such as "#", "%", "&" and "/" are escaped.
+			// This keeps "$urlencode" byte-identical to url.Values.Encode() so
+			// declarative maps build the same request URL as the Go providers.
+			return url.QueryEscape(text), nil
 		case "$toInt":
 			return manifestInt(value), nil
 		case "$toFloat":
