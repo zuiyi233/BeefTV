@@ -94,7 +94,7 @@ BeefTV（`glanderness/BeefTV`）是面向 AI 影视与短剧创作的工作台�
 - 所有对象读取、更新、删除都在 service 校验当前用户和资源归属；管理员权限在 service 校验，不依赖前端隐藏按钮。
 - 默认拒绝本机、私网和链路本地上游。可信开发主机只能通过 `CANVAS_ALLOWED_PRIVATE_UPSTREAM_HOSTS` 精确放行；不要设置“允许全部私网”来绕过 SSRF 防护。
 - 用户 API Key 保存在浏览器本地，任务创建时可能提交给自部署后端；只在可信部署和 HTTPS 下使用真实密钥。日志、错误上报、URL、localStorage 和持久任务正文不得写入敏感 URL、Cookie 或 API Key。
-- 生产必须配置明确的 `CANVAS_CORS_ORIGINS`，保持 HTTPS，限制数据库、备份、数据目录和 `.settings-key` 权限；默认关闭公开注册。
+- 生产必须配置明确的 `CANVAS_CORS_ORIGINS`，保持 HTTPS，限制数据库、备份、数据目录和 `.settings-key` 权限（Windows 上这项限制由数据目录 ACL 提供，`os.Chmod` 不生效，见「Windows 上的凭据文件权限」）；默认关闭公开注册。
 - 数据库字段或表变化时同步更新 `docs/content/docs/backend/backend-database.mdx`，不能只改 GORM model。
 
 ## 6. 画布、UI 和设计系统
@@ -122,10 +122,38 @@ BeefTV（`glanderness/BeefTV`）是面向 AI 影视与短剧创作的工作台�
 项目当前默认不自动运行语法检查、类型检查、测试或构建。用户明确要求验证，或改动风险需要验证时，按范围选择最小充分命令，并在交付中如实记录：
 
 - 前端：`cd web && bun run build`；专项测试用 `bun test ...`。UI 退场规则用 `bun run lint`（只禁 antd Empty 和静态 `Modal.confirm`，不是风格检查）。
-- 后端：`cd backend && go test ./...`；涉及 PostgreSQL、资源、任务或权限时补对应集成/冒烟路径。
+- 后端：默认用受影响包的定向测试（`cd backend && go test ./internal/<pkg> -count=1`）作为门禁；`go test ./...` 全量只在 Linux CI 成立，Windows 与 macOS 存在既有平台失败，见「跨平台测试基线」。涉及 PostgreSQL、资源、任务或权限时补对应集成/冒烟路径。
 - 旧内置 Agent 已从产品运行面退场：`/agent/*` 路由不再注册，通用任务创建、任务重试和任务 Worker 拒绝 `cloud_agent`、`cloud_agent_step`、`agent_memory_compact`，旧轮次与记忆压缩调度保持停用，历史数据保留。当前分支的替换内核采用 `agent-host/` 中钉选的官方 pi SDK，Go 管理运行时、业务轮次及操作授权；React 使用 `/api/assistant/*`。按 `docs/refactor/pi-official-reuse.md` 核对官方 API 与实际接入路径，不能恢复旧入口或另建模型会话循环。零模型宿主验证、真实业务操作、付费模型验收与正式发布分别记证据。
 - 文档站：`cd docs && bun run types:check` 或 `bun run build`。
 - UI 变更能浏览器验证时，检查关键路由、明暗主题、滚动、弹窗、空态和核心交互；不能验证时说明替代依据，不把静态阅读或 `git diff` 写成运行验证。
+
+### 跨平台测试基线
+
+全量 `go test ./...` 只在 Linux 上运行：`quality.yml` 的 Backend checks 固定在 `ubuntu-latest`。矩阵任务 `database-platforms`（macOS + Windows）需要手动 `workflow_dispatch` 才跑，且只覆盖 `internal/database`、`internal/desktopupdate`、`internal/app -run '^TestDBRuntime'`、`cmd/beeftv ./internal/runtimeinfo ./internal/assistantruntime` 四个窄范围；该任务在 Windows 上还刻意绕开 `plugin-packages/build-packages.sh`，改用 Python 直接打 zip。结论：上游从未声称 Windows 全量绿，本机不要用全量套件当回归门。
+
+判定某次失败是否由本轮改动引入，只做两件事：按**失败信息**归因（不数总量），并在改动前的提交上建临时 worktree 复跑同一条命令、比对**失败用例名集合**（`git worktree add .local/tmp/<name> <sha> --detach`，用完 `git worktree remove`）。只有新增的用例名才算回归；不要为消除噪音修改无关的上游测试。
+
+本机（Windows）既有失败分五类，都不是逻辑缺陷：
+
+1. `t.TempDir()` 清理时 SQLite 句柄未释放，报 `unlinkat ... used by another process`（占绝大多数）。测试开着 gorm 连接却不 `Close`，POSIX 允许删除打开的文件、Windows 不允许；失败发生在 teardown，用例断言本身已通过。
+2. Windows 上 `os.Chmod` 表达不出 POSIX 权限位，`info.Mode().Perm()` 不会是 `0600`。断言已改为 `backend/internal/privatefile.Verify`，见「Windows 上的凭据文件权限」。
+3. 符号链接需要 `SeCreateSymbolicLinkPrivilege`（开发者模式或管理员），报 `A required privilege is not held by the client`。
+4. 测试自造的 fixture 依赖 `/bin/sh`，Windows 不存在。
+5. 测试写出的 fake `ffmpeg` 等可执行文件在 Windows 上无法 exec。
+
+### 桌面形态构建
+
+`-tags desktop,production,wv2runtime.*` 由 `wails build` 注入；裸 `go build ./cmd/desktop` **编译不过**（`internal/app` 的 `CreateApp` 与 `(*App).Run` 只在 `production` 或 `dev` 约束下定义），不是"假绿"。CGO 来自 `mattn/go-sqlite3`，需要 C 编译器；发布脚本只查 `PATH` 与 `CC`，不安装编译器，也不改用户 PATH——先确认机器上是否已有，再谈安装。
+
+### Windows 上的凭据文件权限
+
+生产代码统一用 `os.Chmod(path, 0o600)` 写凭据文件（owner token、宿主 token、客户端登记表、provider 配置、`.settings-key`），但 **Windows 的 Chmod 只影响只读位，读取权限完全由文件 DACL 决定**，所以"0600"在两个平台上不是同一个保证。断言统一走 `backend/internal/privatefile.Verify(path)`：POSIX 比权限位，Windows 枚举 DACL 的显式授予项，只放过当前用户、`SYSTEM`、内置管理员与 `CREATOR OWNER`；`BUILTIN\Users`、`NT AUTHORITY\Authenticated Users`、`EVERYONE` 一类主体判为不私有，NULL DACL（等价于不限制）同样判失败。遇到无法解析的 ACE 类型时明确报错，不返回"看起来通过其实没校验"。
+
+本机实测结论，改动凭据存储或数据目录策略时按这个事实推理：
+
+- 桌面发行包的默认数据目录是 `os.UserConfigDir()/BeefTV`（`cmd/desktop/main.go` 的 `defaultDataDir`），实测 `%APPDATA%\BeefTV\agent_owner_token` 与 `agent_host_token` 通过校验，只对本机用户开放。
+- 把数据目录指到共享卷会实际放开读取权限：实测 `CANVAS_DESKTOP_DATA_DIR` 指向 D 盘目录时，写出的 `agent_owner_token` 继承了 `NT AUTHORITY\Authenticated Users` 的授予项。owner 凭据等价于整个工作区的写权限，因此**宿主机开发或自部署把数据目录放在非系统卷上时，必须检查该目录的 ACL**，不要假定 `0600` 已经生效。
+- 因此不要声称"凭据文件受 `0600` 保护"，要说"仅对本机用户可读，Windows 上由 DACL 保证"。
 
 同类失败连续三次时停止盲试，记录现象、已排除项和新假设，再切换路径或请求用户决策。
 

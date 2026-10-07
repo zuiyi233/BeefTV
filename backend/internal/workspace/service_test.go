@@ -3,9 +3,10 @@ package workspace
 import (
 	"bytes"
 	"encoding/json"
-	"os"
 	"path/filepath"
 	"testing"
+
+	"infinite-canvas/backend/internal/privatefile"
 )
 
 func TestProviderConfigIsAtomicPrivateAndPreservesRedactedSecrets(t *testing.T) {
@@ -19,12 +20,10 @@ func TestProviderConfigIsAtomicPrivateAndPreservesRedactedSecrets(t *testing.T) 
 		t.Fatal(err)
 	}
 
-	info, err := os.Stat(filepath.Join(dir, LocalProviderConfigFile))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := info.Mode().Perm(); got != 0o600 {
-		t.Fatalf("provider config mode = %o, want 600", got)
+	// provider 配置里可能是真实上游密钥；Windows 上权限由 DACL 决定，
+	// 比权限位在发布平台上说明不了任何事，交给跨平台校验。
+	if err := privatefile.Verify(filepath.Join(dir, LocalProviderConfigFile)); err != nil {
+		t.Fatalf("provider config 必须只对本机用户可读: %v", err)
 	}
 
 	redacted, err := store.ReadRedactedModelConfig()

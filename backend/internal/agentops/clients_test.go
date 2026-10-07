@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"infinite-canvas/backend/internal/privatefile"
 )
 
 // 已有安装的登记文件没有 kind / lastUsedAt / revokedAt：升级后必须照旧能用，
@@ -122,12 +124,10 @@ func TestRegistryNeverStoresRawToken(t *testing.T) {
 	if strings.Contains(string(raw), token) {
 		t.Fatal("登记文件里出现了原始 token")
 	}
-	info, err := os.Stat(registry.path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Mode().Perm() != 0o600 {
-		t.Fatalf("登记文件权限应为 0600，得到 %v", info.Mode().Perm())
+	// 生产代码用 Chmod(0600) 写登记表，但 Windows 的权限由文件 DACL 决定；
+	// 直接比权限位在发布平台上没有意义，交给跨平台校验。
+	if err := privatefile.Verify(registry.path); err != nil {
+		t.Fatalf("登记文件必须只对本机用户可读: %v", err)
 	}
 }
 
