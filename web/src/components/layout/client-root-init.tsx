@@ -51,7 +51,10 @@ export function ClientRootInit({ children }: { children: ReactNode }) {
     }, []);
 
     useEffect(() => {
-        if (!userId || localMode || !pluginStoreHydrated) return;
+        // 本地形态同样需要插件运行状态：画布「生成来源」按 effectiveEnabled 决定是否给出
+        // RunningHub / ComfyUI 工作流选项，跳过拉取会让这些选项永远不出现。
+        // 插件中心不可用时下方的 catch 会退回空状态，不改变既有降级行为。
+        if (!userId || !pluginStoreHydrated) return;
         let cancelled = false;
         void appQueryClient.fetchQuery({ queryKey: ["plugin-runtime", userId], queryFn: fetchPluginRuntimeState, staleTime: 30_000 })
             .then(async (runtime) => {
