@@ -24,6 +24,7 @@ BeefTV 是一个本地优先、轻量、AI Native 的视频工作台。本页只
 - [HTTP API](content/docs/backend/http-api.mdx)
 - [代码地图](content/docs/backend/code-map.mdx)
 - [官方 Pi SDK 复用矩阵](refactor/pi-official-reuse.md)
+- [Durable 会话换模型失效](refactor/durable-model-switch-20261008.md)
 - [后端数据库](content/docs/backend/backend-database.mdx)
 - [ComfyUI 工作流](content/docs/backend/comfyui-integration.mdx)
 - [任务运行时稳定性](content/docs/backend/task-runtime-stability.mdx)

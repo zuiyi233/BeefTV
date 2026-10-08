@@ -223,6 +223,34 @@ beeftv client register --label dev-agent --mode read-only
 
 `BEEFTV_ALLOWED_ORIGINS` 只影响「这个请求算不算本机同源」，不会打开任何出网能力。出网侧仍默认拒绝本机、私网和链路本地上游，只能按**主机名**精确放行 `CANVAS_ALLOWED_PRIVATE_UPSTREAM_HOSTS`（见「ComfyUI 工作流」的前置条件一节）。本项目不提供「允许全部私网」这种联调绕法：上游被拒时补具体主机名，不要放开整段网段。
 
+## 内置创作助手的本地宿主
+
+内置助手由 `agent-host/server.mjs` 承担模型与工具循环，Go 只做运行时、业务回合与操作授权。`cmd/server` 不会传入随包运行时，因此**必须**在后端数据目录写 `agent_config.json`，否则 `/api/assistant/status` 与 `/api/assistant/chat` 都会返回 `reason=host_command_missing`：
+
+```json
+{
+  "hostCommand": "C:\\Program Files\\nodejs\\node.exe",
+  "hostArgs": ["D:\\path\\to\\BeefTV\\agent-host\\server.mjs"],
+  "newSessionRuntime": "durable"
+}
+```
+
+- 解析入口是 `backend/internal/assistantruntime/config.go` 的 `EffectiveConfig`：`hostCommand` 为空时只尝试 `BundledConfig`（桌面发行包的随包 Node 布局），独立服务形态没有这条退路。
+- `newSessionRuntime` 缺省即 `durable`；填 `sdk` 才回到旧的 SDK 会话路径。
+- 改这个文件或改模型渠道后，用 `POST /api/assistant/host/restart` 让后端重新拉起宿主；`agent_config.json` 只在宿主启动时读取。
+- 宿主依赖必须按 `agent-host/bun.lock` 安装（lockfileVersion 2，需要 Bun 1.4.x）：`cd agent-host && bun install --frozen-lockfile`。上游升级 pi SDK 后不重装依赖，宿主会在导入阶段失败。
+
+助手的模型选择来自工作区模型配置，两条容易踩的规则：
+
+- `channels[].modelProfiles[].protocol` 必须是助手支持的文本协议名（`chat-completion`、`responses`、`claude-api`、`chatgpt-subscription`），写 `openai` 这类渠道格式会得到 `reason=model_protocol_unsupported`；判据在 `backend/internal/modelcatalog/assistant.go`。
+- `assistantModel` 用 `<channelId>::<modelId>` 形式；留空时回退到 `textModel`。
+
+自建推理服务需要注意上下文：助手的系统提示加 26 个操作定义约 15k tokens，`llama-server` 默认的 8192 会让每轮以 `exceed_context_size_error` 失败，信封表现为 `reason=model_error`。本地验收建议 `-c 32768`，并带 `--jinja` 才能用模型自带的工具调用模板。
+
+### 换模型之后旧会话不可用
+
+durable 会话的回合 checkpoint 里保存 `{provider, modelId}` 引用，恢复时用当前注册表解析；解析不到就落到 `@earendil-works/pi-durable` 的 `failNoModel`，回合表现为 `status=unanswered`、`reason=no_model`，而 `/api/assistant/status` 仍然返回 `available: true`。因此**在已有对话里更换助手模型会让该对话永久失效**，新建会话才恢复。判定方法：同模型仅重启宿主后复用旧会话正常；换模型并重启后同一会话每轮 `no_model`，同一时刻新建会话正常。
+
 ## Docker 开发
 
 需要容器化热更新时，在仓库根目录执行：
