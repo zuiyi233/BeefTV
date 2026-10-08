@@ -89,7 +89,7 @@ Wails 和浏览器开发模式共用同一套 `127.0.0.1` HTTP 合同。路由�
 
 | 端点 | 说明 |
 | --- | --- |
-| `GET /assistant/status` | 免身份的宿主状态查询（不含任何凭据）；未就绪时返回明确原因而不是空回复 |
+| `GET /assistant/status` | 免身份的宿主状态查询（不含任何凭据）；未就绪时返回明确原因而不是空回复；可带可选查询参数 `canvasId`，只用于附带该画布的会话级提示 `sessionWarning` |
 | `POST /assistant/ui-session` | 签发短期限 UI 会话凭据；需本机同源，并且能出示 owner 凭据（或显式本地引导开关） |
 | `POST /assistant/chat` | NDJSON 流式对话：`text_delta` 增量 + 一次 `turn_end` 结算；可带 `references: [{kind,id}]` 追加已校验的素材/画布引用；宿主凭据与模型密钥由后端注入，页面不接触 |
 | `POST /assistant/cancel` | 取消指定画布正在进行的回合 |
@@ -100,6 +100,22 @@ Wails 和浏览器开发模式共用同一套 `127.0.0.1` HTTP 合同。路由�
 宿主对模型请求与工具步骤各自有单轮上限（`BEEFTV_AGENT_MAX_REQUESTS_PER_TURN`、
 `BEEFTV_AGENT_MAX_TOOL_STEPS_PER_TURN`），按轮独立计数、下一轮从零开始；总预算
 `BEEFTV_AGENT_TOTAL_REQUEST_BUDGET` 默认关闭，只有显式配置才启用。
+
+### 换模型后的旧会话
+
+durable 会话在建立时记下当时的模型引用。助手模型换过之后，宿主在新建或激活这条会话时按官方接口把它改绑到当前模型，
+所以旧对话继续可用；读取历史不会改写会话文档。仍然无法改写的只有**已经在旧模型引用上落下 checkpoint 的那一轮**：
+它的引用不在任何公开接口的可改范围内，因此那一轮以 `turn_end.errorReason=session_model_changed` 结算，而不是裸的 `no_model`，
+后续轮次回到当前模型后不再出现。`POST /assistant/chat` 转发 `turn_end` 时不改写宿主原文；宿主直接拒绝这次对话时，
+`reason` 也原样透传，`msg` 固定为「这一轮开始时用的是另一个模型，创作助手没有执行它。现在已改用当前模型，重新发送这条要求即可继续；也可以新建对话，历史仍然可以查看。」
+
+`session_model_changed` 是**会话级**原因，与模型不可用、协议不支持不是一个层次：宿主健康、当前模型可解析，
+所以 `GET /assistant/status` 仍然是 `available: true`，不会因为这条原因被报成不可用（那会连新建对话一起拦住）。
+界面带上 `canvasId` 查询参数时，如果当前进程在这条画布上观测到过该原因，`data` 会额外带 `sessionWarning: "session_model_changed"`；
+不带 `canvasId` 或这个免身份接口解析不出当前用户时就不带该字段。该观测按用户与画布分开，只在内存里有界保存
+（过期时间 30 分钟、最多 256 条，后端重启即失效），既不是权限也不是持久状态，不能作为「这条会话能不能用」的判据。
+`POST /assistant/sessions` 成功新建会话会清除该画布的提示；`POST /assistant/sessions/activate` 不清除，
+是否失效交给下一条回合的真实结果判定。受影响的只有改绑发生前那一条要求：重新发送它即可，想从头开始也可以新建对话，旧对话的历史仍然可以查看。
 
 ### 外部客户端连接
 

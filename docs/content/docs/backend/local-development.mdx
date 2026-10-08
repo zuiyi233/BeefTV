@@ -247,9 +247,9 @@ beeftv client register --label dev-agent --mode read-only
 
 自建推理服务需要注意上下文：助手的系统提示加 26 个操作定义约 15k tokens，`llama-server` 默认的 8192 会让每轮以 `exceed_context_size_error` 失败，信封表现为 `reason=model_error`。本地验收建议 `-c 32768`，并带 `--jinja` 才能用模型自带的工具调用模板。
 
-### 换模型之后旧会话不可用
+### 换模型之后的旧会话
 
-durable 会话的回合 checkpoint 里保存 `{provider, modelId}` 引用，恢复时用当前注册表解析；解析不到就落到 `@earendil-works/pi-durable` 的 `failNoModel`，回合表现为 `status=unanswered`、`reason=no_model`，而 `/api/assistant/status` 仍然返回 `available: true`。因此**在已有对话里更换助手模型会让该对话永久失效**，新建会话才恢复。判定方法：同模型仅重启宿主后复用旧会话正常；换模型并重启后同一会话每轮 `no_model`，同一时刻新建会话正常。
+durable 会话的回合 checkpoint 里保存 `{provider, modelId}` 引用。助手模型换过之后，宿主在**新建或激活**这条会话时按官方接口把它的模型引用改绑成当前配置的模型，所以旧对话继续可用，不必新建会话；读取历史不会改写会话文档。唯一还受影响的是**已经在那个模型引用上建立 checkpoint 的在途轮次**——官方接口改不到它，那一轮以 `status=unanswered` 结束并回报 `reason=session_model_changed`（不再是裸的 `no_model`），下一轮就恢复正常。`/api/assistant/status` 全程 `available: true`，只在带 `canvasId` 且本进程观测到该画布出现过这条原因时附带 `sessionWarning`；处理方式是把那一条要求重新发送，或直接新建一条对话，旧对话的历史照常可读。判定方法：同模型仅重启宿主后复用旧会话正常；换模型并重启后同一旧会话继续可用；换模型前那轮在途请求结算为 `session_model_changed`，随后一轮正常回复。
 
 ## Docker 开发
 
