@@ -8,6 +8,7 @@ import { NODE_DEFAULT_SIZE } from "@/constant/canvas";
 import { resolveAudioSpeechSettings } from "@/lib/audio-generation";
 import { normalizeVideoDuration, normalizeVideoResolution } from "@/lib/video-generation-options";
 import { isSeedanceVideoConfig } from "@/lib/seedance-video";
+import { seedancePortraitModel } from "@/lib/seedance-portrait";
 import { modelCapabilityConfigFor, workflowFieldCurrentValue, workflowFieldHasStoredValue, workflowFieldKey, workflowFieldRandomKey, workflowFieldSubmissionValue, workflowOutputSizeValue, workflowVideoFieldsFromJson } from "@/lib/model-capabilities";
 import { modelRequestOptions, resolveCompatibleModel, resolveModelGenerationDefaults, resolveVideoOperation, type ModelGenerationDefaults, type ModelRequirements } from "@/lib/model-selection";
 import { imageMetadata } from "@/lib/canvas/canvas-generation-task-sync";
@@ -18,6 +19,9 @@ import type { CanvasNodeGenerationMode } from "@/components/canvas/canvas-node-p
 import { CanvasNodeType, type CanvasAssistantSession, type CanvasConnection, type CanvasImageGenerationType, type CanvasNodeData, type CanvasNodeMetadata, type CanvasVideoEditOperation } from "@/types/canvas";
 import type { ReferenceImage } from "@/types/image";
 import type { ReferenceAudio, ReferenceVideo } from "@/types/media";
+import { assertUserScope, captureUserScope, isUserScopeAbandonedError } from "@/lib/user-scope-guard";
+import { CanvasGenerationDurableAckError } from "@/services/canvas-generation-errors";
+import type { persistCanvasGenerationTarget } from "@/services/canvas-generation-target";
 
 export async function runBackendCanvasGenerationTask(
     {
@@ -130,23 +134,48 @@ export async function runCanvasGenerationTaskToConsumer(
         bindTask(task: GenerationTask): void;
         consumeTask(task: GenerationTask): Promise<void>;
         runTask?: (options: Parameters<typeof runBackendCanvasGenerationTask>[0]) => ReturnType<typeof runBackendCanvasGenerationTask>;
+        prepareTarget?: typeof persistCanvasGenerationTarget;
     },
 ) {
     return runGenerationOperationOnce(input.clientOperationId, async () => {
+        const expectedScope = input.expectedScope ?? captureUserScope();
+        if (input.mode === "image") {
+            const prepare = dependencies.prepareTarget ?? (await import("@/services/canvas-generation-target")).persistCanvasGenerationTarget;
+            await prepare({ ...input, expectedScope });
+        }
+        if (input.signal?.aborted) throw new DOMException("The operation was aborted", "AbortError");
+        assertUserScope(expectedScope);
         let completedTask: GenerationTask | undefined;
         const result = await (dependencies.runTask ?? runBackendCanvasGenerationTask)({
             ...input,
+            expectedScope,
             onTaskCreated: (task) => {
+                if (input.signal?.aborted) throw new DOMException("The operation was aborted", "AbortError");
+                assertUserScope(expectedScope);
                 input.onTaskCreated?.(task);
                 dependencies.bindTask(task);
                 if (task.status === "succeeded") completedTask = task;
             },
         });
+        if (input.signal?.aborted) throw new DOMException("The operation was aborted", "AbortError");
+        assertUserScope(expectedScope);
         if (!completedTask) throw new Error("生成任务缺少成功终态");
         const taskForConsumer = input.mode === "text" && completedTask.type === "canvas_text" && result.text
             ? hydrateCompletedTextTask(completedTask, result.text)
             : completedTask;
-        await dependencies.consumeTask(taskForConsumer);
+        try {
+            await dependencies.consumeTask(taskForConsumer);
+            if (input.signal?.aborted) throw new DOMException("The operation was aborted", "AbortError");
+            assertUserScope(expectedScope);
+        } catch (error) {
+            if (isUserScopeAbandonedError(error) || (error instanceof Error && error.name === "AbortError")) throw error;
+            const cause = error instanceof CanvasGenerationDurableAckError ? error.cause : error;
+            dependencies.bindTask({
+                ...taskForConsumer,
+                failureDiagnostics: { ...taskForConsumer.failureDiagnostics, source: "client_result", executionResult: "completed", stage: "画布应用结果", summary: cause instanceof Error ? cause.message : "画布应用结果失败", capturedAt: new Date().toISOString() },
+            });
+            throw error instanceof CanvasGenerationDurableAckError ? error : new CanvasGenerationDurableAckError(error);
+        }
         return result;
     });
 }
@@ -567,6 +596,9 @@ export function buildGenerationConfig(config: AiConfig, node: CanvasNodeData | u
 export function resolveCanvasGenerationModel(config: AiConfig, model: string | undefined, mode: CanvasNodeGenerationMode): string {
     if (!model) return "";
     const normalized = normalizeModelOptionValue(model, config.channels);
+    // Keep an explicit paid-tier choice when its catalog entry disappears.
+    // Validation will report unavailable instead of choosing a standard default.
+    if (mode === "video" && seedancePortraitModel(model)) return normalized || model;
     if (!normalized) return "";
     return configuredModelMatchesCapability(config, normalized, mode) ? normalized : "";
 }

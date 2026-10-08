@@ -1,6 +1,7 @@
 // 助手面板里所有用户可见文案的唯一来源：机器可读原因、操作名和改动摘要都在这里
 // 翻译成用户语。组件只负责排版，不自己拼文案，避免同一种状态在两处写出两句话。
 import type { AgentLifecycleEvent, AgentToolCall, AssistantGenerationProposal, AssistantTurnChange, AssistantUndoFailure } from "@/services/api/agent-assistant";
+import { seedancePortraitLabel } from "@/lib/seedance-portrait";
 
 export type AssistantStatusAction = "model-settings" | "retry";
 
@@ -21,7 +22,7 @@ export function assistantStatusNotice(reason: string | undefined): AssistantStat
         case "model_protocol_unsupported":
             return { text: "还没有可用的助手模型", actionLabel: "去模型配置", action: "model-settings" };
         case "credential_missing":
-            return { text: "BeefAPI 还没连接好", actionLabel: "去连接", action: "model-settings" };
+            return { text: "BeefTV 还没连接好", actionLabel: "去连接", action: "model-settings" };
         case "host_starting":
             return { text: "助手正在启动…", starting: true };
         case "host_start_failed":
@@ -37,10 +38,21 @@ export function assistantActionLabel(tool: string | undefined): string {
     const name = (tool || "").trim();
     if (name.startsWith("asset.")) return "读取素材";
     switch (name) {
+        case "media.overview":
+        case "media_overview":
+            return "浏览素材";
+        case "media.inspect":
+        case "media_inspect":
+            return "查看和听取素材";
+        case "media.check":
+        case "media_check":
+            return "检查媒体文件";
         case "canvas.nodes.create":
             return "新建节点";
         case "canvas.node.update":
             return "修改节点";
+        case "canvas.timeline.update":
+            return "修改时间线";
         case "canvas.edge.create":
             return "连线";
         case "canvas.get":
@@ -65,12 +77,20 @@ export function assistantFailedActionText(call: AgentToolCall): string {
 export function assistantChangeSummary(change: AssistantTurnChange | null | undefined): string | null {
     if (!change) return null;
     const parts: string[] = [];
-    const created = change.createdNodeIds?.length ?? 0;
-    const updated = change.updatedNodeIds?.length ?? 0;
-    const edges = change.createdEdgeIds?.length ?? 0;
+    const changes = change.canvasChanges?.length ? change.canvasChanges : [change];
+    if (change.canvasChanges?.length) parts.push(`修改了 ${new Set(change.canvasChanges.map(item => item.canvasId)).size} 个画布`);
+    const created = changes.reduce((total, item) => total + (item.createdNodeIds?.length ?? 0), 0);
+    const updated = changes.reduce((total, item) => total + (item.updatedNodeIds?.length ?? 0), 0);
+    const deleted = changes.reduce((total, item) => total + (item.deletedNodeIds?.length ?? 0), 0);
+    const edges = changes.reduce((total, item) => total + (item.createdEdgeIds?.length ?? 0), 0);
+    const deletedEdges = changes.reduce((total, item) => total + (item.deletedEdgeIds?.length ?? 0), 0);
     if (created > 0) parts.push(`新建 ${created} 个节点`);
     if (updated > 0) parts.push(`修改 ${updated} 个节点`);
+    if (deleted > 0) parts.push(`删除 ${deleted} 个节点`);
     if (edges > 0) parts.push(`连了 ${edges} 条线`);
+    if (deletedEdges > 0) parts.push(`删除 ${deletedEdges} 条线`);
+    if (changes.some(item => item.timelineUpdated)) parts.push("修改时间线");
+    if (changes.some(item => item.documentUpdated)) parts.push("修改画布内容");
     if (!parts.length) return null;
     return parts.join("，");
 }
@@ -79,8 +99,9 @@ export function assistantChangeSummary(change: AssistantTurnChange | null | unde
 export function assistantChangedNodeIds(change: AssistantTurnChange | null | undefined): string[] {
     if (!change) return [];
     const ids = new Set<string>();
-    for (const id of change.createdNodeIds || []) ids.add(id);
-    for (const id of change.updatedNodeIds || []) ids.add(id);
+    const deleted = new Set(change.deletedNodeIds || []);
+    for (const id of change.createdNodeIds || []) if (!deleted.has(id)) ids.add(id);
+    for (const id of change.updatedNodeIds || []) if (!deleted.has(id)) ids.add(id);
     return [...ids];
 }
 
@@ -98,10 +119,10 @@ export function assistantUndoFailureText(failure: AssistantUndoFailure): string 
 }
 
 /** 提议可能来自自建渠道，不能把所有费用都归到 BeefAPI。 */
-export function assistantProposalText(proposal: AssistantGenerationProposal): string {
+export function assistantProposalText(proposal: AssistantGenerationProposal, priceLines: string[] = []): string {
     const count = proposal.nodeIds?.length ?? 0;
     const target = proposal.kind === "video" ? "视频" : "图片";
-    return `生成 ${count} ${target === "视频" ? "段视频" : "张参考图片"} · ${proposal.model}\n确认后开始，按所选渠道计费。`;
+    return `生成 ${count} ${target === "视频" ? "段视频" : "张参考图片"} · ${seedancePortraitLabel(proposal.model) || proposal.model}\n${priceLines.length ? priceLines.join("\n") + "\n" : ""}确认后开始，按所选渠道计费。`;
 }
 
 export const ASSISTANT_STARTER_PROMPTS = [
@@ -112,9 +133,16 @@ export const ASSISTANT_STARTER_PROMPTS = [
 ];
 
 /** 官方压缩/重试进度：只说现在在做什么，不提内部事件名。 */
-export function assistantLifecycleText(event: Pick<AgentLifecycleEvent, "phase"> | string | null | undefined): string | null {
+export function assistantLifecycleText(event: { phase: AgentLifecycleEvent["phase"] | "tool" | "tool_end"; toolName?: string } | string | null | undefined): string | null {
     const phase = typeof event === "string" ? event : event?.phase;
     switch (phase) {
+        case "tool": {
+            const tool = typeof event === "string" ? undefined : event?.toolName;
+            if (tool === "media_overview" || tool === "media.overview") return "正在浏览素材，确认画面和声音。";
+            if (tool === "media_inspect" || tool === "media.inspect") return "正在查看和听取选定片段。";
+            if (tool === "media_check" || tool === "media.check") return "正在检查黑屏、音轨和文件信息。";
+            return null;
+        }
         case "compaction":
             return "正在整理对话内容，方便继续。";
         case "retry":
@@ -123,6 +151,14 @@ export function assistantLifecycleText(event: Pick<AgentLifecycleEvent, "phase">
             return null;
     }
 }
+
+/** 这里只提供继续对话入口，不重发原请求，也不保证后台任务已恢复。 */
+export function assistantTurnCanContinue(reason: string | null | undefined): boolean {
+    return ["turn_timeout", "turn_interrupted", "turn_request_budget_exhausted", "turn_tool_step_budget_exhausted", "model_request_failed", "model_error", "provider_error"].includes(reason || "");
+}
+
+export const ASSISTANT_CONTINUE_PROMPT = "继续完成上一条要求。先检查当前画布和已经完成的操作，保留已有结果；不要重复创建节点或重新提交已开始的生成任务。";
+export const ASSISTANT_UNDONE_INCOMPLETE_TEXT = "这一轮未完成，已经产生的画布改动已撤销。";
 
 const REASONING_TAG_PREFIXES = ["</thinking>", "<thinking>", "</think>", "<think>"];
 
@@ -166,12 +202,21 @@ export function assistantVisibleReply(text: string): string {
     return output.trim();
 }
 
-/** 同一件事的身份：修改看节点，连线看两端，新建看有没有再次成功；读操作失败不影响画布，不单独提示。 */
+/** 修改看节点，连线看两端；媒体读取失败会影响审片结论，按同一片段判断是否后来成功。 */
 function assistantActionTarget(call: AgentToolCall): string | null {
     const args = call.args || {};
     switch (call.tool) {
+        case "media.overview":
+        case "media.inspect":
+        case "media.check":
+        case "media_overview":
+        case "media_inspect":
+        case "media_check":
+            return `media:${JSON.stringify(args)}`;
         case "canvas.node.update":
             return `update:${String(args.nodeId ?? "")}`;
+        case "canvas.timeline.update":
+            return "timeline";
         case "canvas.edge.create":
             return `edge:${String(args.fromNodeId ?? "")}>${String(args.toNodeId ?? "")}`;
         case "canvas.nodes.create":
@@ -197,8 +242,12 @@ export function assistantUnresolvedFailures(calls: AgentToolCall[] | undefined):
         if (!target) return;
         const resolved = list.slice(index + 1).some((later) => !later.isError && later.tool === call.tool && assistantActionTarget(later) === target);
         if (resolved) return;
-        const label = assistantActionLabel(call.tool);
+        const label = call.tool.replace("_", ".") === "media.inspect"
+            ? call.args?.mode === "audio" ? "有音频片段听取未完成"
+                : call.args?.mode === "video" ? "有视频片段查看未完成"
+                    : !call.args?.mode || call.args.mode === "frames" ? "有素材的画面查看未完成" : `${assistantActionLabel(call.tool)}没有成功`
+            : `${assistantActionLabel(call.tool)}没有成功`;
         counts.set(label, (counts.get(label) ?? 0) + 1);
     });
-    return [...counts.entries()].map(([label, count]) => (count > 1 ? `${label}没有成功（${count} 处）` : `${label}没有成功`));
+    return [...counts.entries()].map(([label, count]) => (count > 1 ? `${label}（${count} 处）` : label));
 }

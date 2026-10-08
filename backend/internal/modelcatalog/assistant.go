@@ -26,7 +26,7 @@ var assistantProtocols = map[string]string{
 	"chatgpt-subscription": "chatgpt-subscription",
 }
 
-var managedAssistantModels = []string{beefapi.DefaultManagedAssistantModel, "claude-opus-5-5", "deepseek-v4.1-flash", "glm-5.3"}
+var managedAssistantModels = []string{beefapi.DefaultManagedAssistantModel, "claude-opus-5-5", "deepseek-v4.1-flash", "glm-5.3", "gemini-3.8-flash"}
 
 type AssistantModelProfile struct {
 	Model      string `json:"model"`

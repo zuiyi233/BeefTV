@@ -1,5 +1,5 @@
 import { App, Button } from "antd";
-import { ArrowLeft, Boxes, RadioTower } from "lucide-react";
+import { ArrowLeft, Boxes, Bug, RadioTower } from "lucide-react";
 import { useEffect, useLayoutEffect, useMemo, useState, type ReactNode } from "react";
 import { useNavigate, useSearchParams } from "react-router";
 
@@ -8,12 +8,14 @@ import { useUserStore } from "@/stores/use-user-store";
 import { ChannelSettingsPane, channelValidationError, focusInvalidChannelField, isChannelReady } from "./channel-settings-pane";
 import { ComfyUISettingsPane } from "./comfyui-settings-pane";
 import { ModelDefaultGrid } from "./model-default-grid";
+import DiagnosticsPanel from "./diagnostics-panel";
 
-type ConfigSectionKey = "channels" | "models" | "comfyui";
+type ConfigSectionKey = "channels" | "models" | "comfyui" | "diagnostics";
 
 const configSections: Array<{ key: ConfigSectionKey; label: string; description: string; icon: ReactNode }> = [
     { key: "channels", label: "个人渠道", description: "模型服务与个人工作流", icon: <RadioTower className="size-4" /> },
     { key: "comfyui", label: "ComfyUI", description: "连接本地原生 ComfyUI 工作流", icon: <Boxes className="size-4" /> },
+    { key: "diagnostics", label: "问题诊断", description: "导出问题记录", icon: <Bug className="size-4" /> },
 ];
 
 export function isConfigSection(value: string | null): value is ConfigSectionKey {
@@ -75,13 +77,14 @@ export default function SettingsPage() {
     };
 
     const panes: Record<ConfigSectionKey, ReactNode> = {
+        diagnostics: <DiagnosticsPanel taskId={searchParams.get("taskId") || undefined} projectId={searchParams.get("projectId") || undefined} />,
         channels: (
             <SettingsPane>
                 <ChannelSettingsPane onOpenComfyUI={() => selectSection("comfyui")} />
-                <div className="settings-section mt-4">
+                <div className="settings-section model-default-section">
                     <div className="settings-pane-header">
                         <div className="min-w-0">
-                            <h2>模型选择</h2>
+                            <h2>默认模型</h2>
                         </div>
                     </div>
                     <ModelDefaultGrid config={effectiveConfig} onChange={(key, model) => updateConfig(key, model)} />
@@ -110,14 +113,19 @@ export default function SettingsPage() {
 
     return (
         <main className="settings-page app-workspace-page app-user-workspace app-section-page flex h-full min-h-0 flex-col text-foreground">
-            {shouldPromptContinue ? (
                 <div className="settings-topbar shrink-0">
                     <div className="ml-auto flex flex-wrap items-center justify-end gap-2">
+                        {activeTab === "diagnostics" ? (
+                            <Button icon={<ArrowLeft className="size-4" />} onClick={() => selectSection("channels")}>返回模型配置</Button>
+                        ) : (
+                            <Button icon={<Bug className="size-4" />} onClick={() => selectSection("diagnostics")}>问题诊断</Button>
+                        )}
+                        {shouldPromptContinue ? <>
                         <Button icon={<ArrowLeft className="size-4" />} onClick={() => navigate(-1)}>返回创作</Button>
                         <Button type="primary" onClick={finishConfig}>保存并返回</Button>
+                        </> : null}
                     </div>
                 </div>
-            ) : null}
             <div className="settings-library-frame flex min-h-0 flex-1 flex-col md:flex-row">
                 <section className="settings-content flex min-h-0 min-w-0 flex-1 flex-col">
                     <div className="app-workspace-scroll app-section-page-content min-h-0 flex-1 overflow-y-auto overscroll-contain">

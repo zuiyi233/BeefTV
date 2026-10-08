@@ -5,9 +5,10 @@ import { Popover } from "antd";
 import { canvasThemes, type CanvasTheme } from "@/lib/canvas-theme";
 import { compatibleModelInGroup, configuredModelDisplayName, groupModelsByDisplayName, modelCompatibilityError, resolveCompatibleModel, type ModelRequirements } from "@/lib/model-selection";
 import { cn } from "@/lib/utils";
-import { modelDisplayName, modelIcon, PUBLIC_MODEL_CATALOG_ID, resolveModelChannel, selectableModelsByCapability, type AiConfig, type ModelCapability } from "@/stores/use-config-store";
+import { modelDisplayName, modelIcon, modelOptionName, PUBLIC_MODEL_CATALOG_ID, resolveModelChannel, selectableModelsByCapability, type AiConfig, type ModelCapability } from "@/stores/use-config-store";
 import { useActiveTheme } from "@/stores/canvas/use-canvas-theme-store";
 import { ModelLogo } from "@/components/model-logo";
+import { portraitPriceLines, seedancePortraitLabel, seedancePortraitModel } from "@/lib/seedance-portrait";
 
 type ModelPickerProps = {
     config: AiConfig;
@@ -71,10 +72,13 @@ export function ModelPicker({
     const resolvedCurrent = resolveCompatibleModel(config, storedCurrent, selectionRequirements) || storedCurrent;
     // 旧画布可能保存过已下架或前端历史内置模型；它们不能重新进入当前可选目录。
     const current = options.includes(resolvedCurrent) ? resolvedCurrent : "";
+    const portrait = seedancePortraitModel(current || storedCurrent);
+    const portraitQuote = seedancePortraitLabel(current) && current ? resolveModelChannel(config, current).modelProfiles?.find((item) => item.model === modelOptionName(current))?.videoPricing : undefined;
+    const priceLines = portraitPriceLines(portraitQuote);
     const creationVariant = variant === "creation";
     const triggerLabel = current
         ? (creationVariant ? pickerModelDisplayName(config, current, showConfiguredModelName) : pickerModelOptionLabel(config, current, showConfiguredModelName))
-        : placeholder;
+        : portrait ? `${seedancePortraitLabel(storedCurrent)}（不可用）` : placeholder;
 
     useLayoutEffect(() => {
         const trigger = triggerRef.current;
@@ -240,7 +244,7 @@ export function ModelPicker({
     );
 
     return (
-        <div className={cn(fullWidth ? "w-full min-w-0" : "w-fit max-w-full")} onMouseDown={(event) => event.stopPropagation()} onPointerDown={(event) => event.stopPropagation()}>
+        <div className={cn("flex items-center gap-2", fullWidth ? "w-full min-w-0" : "w-fit max-w-full")} onMouseDown={(event) => event.stopPropagation()} onPointerDown={(event) => event.stopPropagation()}>
             <Popover
                 open={open}
                 onOpenChange={setPickerOpen}
@@ -270,6 +274,15 @@ export function ModelPicker({
                     <ChevronDown className={cn("canvas-model-picker-chevron", open && "is-open")} aria-hidden="true" />
                 </button>
             </Popover>
+            {portrait || priceLines.length > 0 ? <Popover trigger="click" placement="topLeft" content={
+                <div className="max-w-[min(26rem,calc(100vw-3rem))] text-xs leading-relaxed" role="note">
+                    {priceLines.length ? <><p>视频参考单价</p>{priceLines.map((line) => <p key={line}>{line}</p>)}<p>实际费用见生成账单。素材仍需通过审核。</p></> : <p>价格暂不可用，请刷新模型列表后再生成。</p>}
+                </div>
+            }>
+                <button type="button" className="shrink-0 rounded px-1 py-1 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" style={{ color: theme.node.muted }} aria-label="视频参考单价" title={priceLines.join("\n") || "价格暂不可用，请刷新模型列表后再生成。"}>
+                    {priceLines.length ? "价格" : "价格暂不可用"}
+                </button>
+            </Popover> : null}
         </div>
     );
 }

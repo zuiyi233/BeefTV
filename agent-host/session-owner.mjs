@@ -31,10 +31,10 @@ function storeClosedError() {
   return error;
 }
 
-export function createSessionStore({ sessionRoot, workspaceRoot, agentDir, runId, getModelRuntime, getModel }) {
+export function createSessionStore({ sessionRoot, workspaceRoot, agentDir, runId, getModelRuntime, getModel,
+  createResourceLoader = ({ cwd, agentDir }) => createFullControlLoader({ cwd, agentDir }) }) {
   const sessions = new Map();
   const canvasLocks = new Map();
-  const resourceLoader = createFullControlLoader();
   let closed = false;
   let inFlightLocks = 0;
   let idleResolvers = [];
@@ -151,13 +151,19 @@ export function createSessionStore({ sessionRoot, workspaceRoot, agentDir, runId
       if (!file) { const error = new Error('session_not_found'); error.reason = 'session_not_found'; throw error; }
       return { manager: SessionManager.open(file, sessionDir, cwd), persistence: `restored:${sessionId}` };
     }
-    return { manager: SessionManager.create(cwd, sessionDir), persistence: 'created' };
+    const manager = SessionManager.create(cwd, sessionDir);
+    // SDK defers its first write until an assistant message. Persist its own header
+    // before publishing current.json so an empty new chat survives a host restart.
+    const file = manager.getSessionFile();
+    fs.writeFileSync(file, `${JSON.stringify(manager.getHeader())}\n`, { flag: 'wx', mode: 0o600 });
+    // Reopening lets the SDK own all subsequent appends, including pre-reply entries.
+    return { manager: SessionManager.open(file, sessionDir, cwd), persistence: 'created' };
   }
 
   async function createLiveSession({ canvasId, sessionId, buildTools }) {
     const cwd = canvasWorkspace(canvasId);
     const log = [];
-    const generation = { aborted: false };
+    const generation = { aborted: false, permissionMode:'full-access' };
     const turn = newTurnAccumulator();
     let opened;
     try {
@@ -172,6 +178,9 @@ export function createSessionStore({ sessionRoot, workspaceRoot, agentDir, runId
     const identity = sessionActionIdentity({ persistedId, runId });
     console.error(`agent-host: 会话 ${canvasId} 的动作身份来源 = ${identity.source}（persistence=${persistence}）`);
     const tools = buildTools(canvasId, log, generation, turn, identity.prefix);
+    generation.permissionMode='canvas';
+    const resourceLoader = await createResourceLoader({ canvasId, cwd, agentDir });
+    await resourceLoader.reload();
     const { session } = await createAgentSession({
       cwd,
       agentDir,
@@ -310,6 +319,11 @@ export function createSessionStore({ sessionRoot, workspaceRoot, agentDir, runId
     }
     if (!observer.settled && !error) {
       error = 'Error: agent run did not settle';
+    }
+    // Official prompt() may resolve normally while the final assistant is an error.
+    const finalMessage = observer.lastAssistantMessage;
+    if (!error && (finalMessage?.stopReason === 'error' || finalMessage?.stopReason === 'aborted')) {
+      error = `Error: ${finalMessage.errorMessage || (finalMessage.stopReason === 'aborted' ? 'agent run aborted' : 'provider request failed')}`;
     }
     return { observer, error, timedOut };
   }

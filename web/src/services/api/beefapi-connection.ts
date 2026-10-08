@@ -1,5 +1,10 @@
 import { http } from "@/services/api/request";
 
+let connectionEpoch = 0;
+export function getBeefAPIConnectionEpoch() {
+    return connectionEpoch;
+}
+
 export type BeefAPIAccount = {
     id: string;
     username?: string;
@@ -32,14 +37,17 @@ export function getBeefAPIConnection(signal?: AbortSignal) {
 }
 
 export function startBeefAPIConnection(signal?: AbortSignal) {
+    connectionEpoch++;
     return http.post<BeefAPIConnectionSummary>("/beefapi/connection/start", {}, { signal });
 }
 
 export function cancelBeefAPIConnection(signal?: AbortSignal) {
+    connectionEpoch++;
     return http.post<BeefAPIConnectionSummary>("/beefapi/connection/cancel", {}, { signal });
 }
 
 export function disconnectBeefAPIConnection(signal?: AbortSignal) {
+    connectionEpoch++;
     return http.post<BeefAPIConnectionSummary>("/beefapi/connection/disconnect", {}, { signal });
 }
 
@@ -73,7 +81,7 @@ export function beefAPIConnectionLabel(summary: BeefAPIConnectionSummary | null 
 
 function connectedAccountLabel(summary: BeefAPIConnectionSummary | null | undefined) {
     const account = summary?.account;
-    const name = account?.display_name || account?.username || account?.email;
+    const name = account?.email || account?.display_name || account?.username;
     if (name && summary?.balance === "zero") return `已连接 ${name}，余额为 0`;
     if (name) return `已连接 ${name}`;
     if (summary?.balance === "zero") return "已连接，余额为 0";
