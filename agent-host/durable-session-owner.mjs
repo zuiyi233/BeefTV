@@ -91,6 +91,15 @@ export function createDurableSessionStore({ sessionRoot, workspaceRoot, getModel
   async function update(entry, mutate) {
     return entry.harness.commit(async (tx) => mutate(await tx.doc(STATE)), CTX);
   }
+  // `harness.root()` applies `agent` only while the root conversation is absent, so re-pointing an existing
+  // session at the current model has to go through the official `Conversation.configure()`. A turn already
+  // checkpointed in `request`/`poll` still reads its own reference, which no public API can rewrite.
+  async function adoptModel(entry, configured) {
+    const referenced = (await entry.root.agent(CTX)).model;
+    const stale = Boolean(referenced) && (referenced.provider !== configured.provider || referenced.modelId !== configured.modelId);
+    entry.modelSwitch = stale ? { from: referenced, to: configured } : null;
+    if (stale || !referenced) await entry.root.configure({ model: configured }, CTX);
+  }
   function hydrate(entry, active) {
     entry.busy = Boolean(active);
     if (!active) return;
@@ -114,7 +123,7 @@ export function createDurableSessionStore({ sessionRoot, workspaceRoot, getModel
       }
     });
   }
-  async function open(canvasId, sessionId) {
+  async function open(canvasId, sessionId, adopt = false) {
     if (!isDurableSessionId(sessionId)) throw fail('session_not_found');
     const uuid = idPattern.exec(sessionId)[1];
     const dir = durableDirectory(canvasId);
@@ -126,7 +135,7 @@ export function createDurableSessionStore({ sessionRoot, workspaceRoot, getModel
     fs.mkdirSync(cwd, { recursive: true });
     const entry = { kind: 'durable', canvasId, sessionId, identity: { prefix: sessionId, source: 'durable-session-id' },
       log: [], generation: { durable: true, aborted: false, intentEpoch: 0, modelEpoch: 0 }, turn: newTurnAccumulator(), busy: false, persistence: 'restored',
-      budgetDirectory: path.join(dir, `${uuid}.budget`) };
+      modelSwitch: null, budgetDirectory: path.join(dir, `${uuid}.budget`) };
     fs.mkdirSync(entry.budgetDirectory, { recursive: true, mode: 0o700 });
     const registry = createRegistry();
     entry.generation.permissionMode='full-access';
@@ -193,8 +202,11 @@ export function createDurableSessionStore({ sessionRoot, workspaceRoot, getModel
         toolExecution: 'sequential', steeringMode: 'all', ...settings },
     }, CTX);
     try {
-      entry.root = await entry.harness.root(CTX, { agent: { model: await getModelRef(entry), tools,
+      const configured = await getModelRef(entry);
+      entry.root = await entry.harness.root(CTX, { agent: { model: configured, tools,
         instructions: SYSTEM_PROMPT, thinkingLevel: 'off', cwd } });
+      // Only taking a session as the canvas' active one adopts it; a plain history read never writes.
+      if (adopt) await adoptModel(entry, configured);
       let hostState = await state(entry);
       if (!hostState) {
         await update(entry, (doc) => { doc.canvasId = canvasId; doc.sessionId = sessionId; });
@@ -213,7 +225,7 @@ export function createDurableSessionStore({ sessionRoot, workspaceRoot, getModel
       fs.mkdirSync(durableDirectory(canvasId), { recursive: true, mode: 0o700 });
       const file = path.join(durableDirectory(canvasId), `${idPattern.exec(sessionId)[1]}.json`);
       fs.writeFileSync(file, JSON.stringify({ sessionId, canvasId, version: DURABLE_VERSION, createdAt: new Date().toISOString() }), { flag: 'wx', mode: 0o600 });
-      const entry = await open(canvasId, sessionId);
+      const entry = await open(canvasId, sessionId, true);
       entry.persistence = 'created';
       publish(entry);
       const previous = sessions.get(canvasId);
@@ -227,7 +239,7 @@ export function createDurableSessionStore({ sessionRoot, workspaceRoot, getModel
       const previous = sessions.get(canvasId);
       if (previous?.sessionId === sessionId) { publish(previous); return previous; }
       if (previous?.busy) throw fail('session_busy');
-      const entry = await open(canvasId, sessionId);
+      const entry = await open(canvasId, sessionId, true);
       publish(entry);
       sessions.set(canvasId, entry);
       if (previous) await previous.harness.close(CTX);
@@ -436,6 +448,14 @@ export function createDurableSessionStore({ sessionRoot, workspaceRoot, getModel
     }
     const preparationError = entry.generation.pendingInputError;
     const completion = preparationError ? { reply: assistant?.content?.filter(block => block.type === 'text').map(block => block.text).join('') || '', cancelled: false, error: preparationError.message, errorReason: preparationError.reason } : durableCompletion(settled, assistant, entry.budget?.failure, active.stopped);
+    // A generation that had already checkpointed before the switch keeps the withdrawn reference in its
+    // checkpoint, which the official task cannot rewrite: it can only settle as the bare `no_model`.
+    // Report the switch instead, and stop reporting it once a turn settles on the adopted model.
+    if (settled.status === 'done') entry.modelSwitch = null;
+    else if (completion.errorReason === 'no_model' && entry.modelSwitch) {
+      completion.errorReason = 'session_model_changed';
+      completion.error = `创作助手已改用 ${entry.modelSwitch.to.modelId}，但这一轮仍绑定在宿主不再提供的 ${entry.modelSwitch.from.provider}/${entry.modelSwitch.from.modelId} 上，因此没有执行。请重新发送这条要求。`;
+    }
     return { ...publicDurableTurn(active), ...completion,
       toolCalls: [...entry.log], change: turnChange(entry.turn), proposals: [...entry.turn.proposals],
       status: settled.status, sessionId: entry.sessionId };

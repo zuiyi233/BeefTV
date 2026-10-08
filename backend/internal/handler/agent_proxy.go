@@ -18,6 +18,7 @@ import (
 
 	"infinite-canvas/backend/internal/agentops"
 	"infinite-canvas/backend/internal/app"
+	"infinite-canvas/backend/internal/assistant"
 	"infinite-canvas/backend/internal/assistantruntime"
 	"infinite-canvas/backend/internal/assistantturns"
 	"infinite-canvas/backend/internal/skills"
@@ -50,6 +51,7 @@ func newTurnID() string {
 // 页面只发业务消息，宿主凭据由后端注入；宿主不可用时返回明确状态而不是空回复。
 func RegisterAgentProxyRoutes(r gin.IRouter, svc *app.Service, clients *agentops.ClientRegistry, ui *uiSessionStore, host *assistantruntime.Host) {
 	client := agentHostClient(10 * time.Minute)
+	warnings := newSessionWarningStore()
 	registerAssistantRuntimeRoutes(r, svc)
 
 	guard := func(c *gin.Context, requireWrite bool) bool {
@@ -113,7 +115,13 @@ func RegisterAgentProxyRoutes(r gin.IRouter, svc *app.Service, clients *agentops
 				ok(c, gin.H{"available": false, "reason": "host_starting", "model": modelInfo})
 				return
 			}
-			ok(c, gin.H{"available": true, "model": modelInfo})
+			// 模型解析成功、宿主健康就是 available:true；会话级「换过模型」只是附加提示，
+			// 不能反过来把可用的宿主报成不可用（那会让新建对话也被拦住）。
+			available := gin.H{"available": true, "model": modelInfo}
+			if warning, found := statusSessionWarning(c, svc, warnings); found {
+				available["sessionWarning"] = warning
+			}
+			ok(c, available)
 			return
 		}
 		if state.Running {
@@ -169,11 +177,12 @@ func RegisterAgentProxyRoutes(r gin.IRouter, svc *app.Service, clients *agentops
 	})
 
 	// hostJSON 把一次 JSON 请求转给宿主并原样回传业务结果；宿主凭据只在这里注入。
-	hostJSON := func(c *gin.Context, method, path string, body []byte) {
+	// 返回 true 表示宿主已按 2xx 受理，调用方据此清掉已过期的会话级提示。
+	hostJSON := func(c *gin.Context, method, path string, body []byte) bool {
 		if host == nil {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"code": http.StatusServiceUnavailable, "reason": "host_unreachable",
 				"msg": "内置创作助手宿主未运行"})
-			return
+			return false
 		}
 		var reader io.Reader
 		if body != nil {
@@ -183,21 +192,21 @@ func RegisterAgentProxyRoutes(r gin.IRouter, svc *app.Service, clients *agentops
 		if err != nil {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"code": http.StatusServiceUnavailable, "reason": "host_unreachable",
 				"msg": "内置创作助手宿主未运行"})
-			return
+			return false
 		}
 		upstream.Header.Set("Content-Type", "application/json")
 		resp, err := agentHostClient(30 * time.Second).Do(upstream)
 		if err != nil {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"code": http.StatusServiceUnavailable, "reason": "host_unreachable",
 				"msg": "内置创作助手宿主未运行"})
-			return
+			return false
 		}
 		defer resp.Body.Close()
 		payload, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 		var decoded any
 		if err := json.Unmarshal(payload, &decoded); err != nil {
 			fail(c, http.StatusBadGateway, app.BadAuthRequest("宿主返回的不是合法 JSON"))
-			return
+			return false
 		}
 		if resp.StatusCode/100 != 2 {
 			reason := "host_unreachable"
@@ -206,8 +215,13 @@ func RegisterAgentProxyRoutes(r gin.IRouter, svc *app.Service, clients *agentops
 					reason = value
 				}
 			}
-			c.JSON(resp.StatusCode, gin.H{"code": resp.StatusCode, "reason": reason, "msg": "内置创作助手宿主拒绝了该请求"})
-			return
+			// reason 保持宿主给的机器可读原因，不被白名单改写。
+			message := "内置创作助手宿主拒绝了该请求"
+			if actionable, found := assistant.HostTurnReasonMessage(reason); found {
+				message = actionable
+			}
+			c.JSON(resp.StatusCode, gin.H{"code": resp.StatusCode, "reason": reason, "msg": message})
+			return false
 		}
 		if strings.HasPrefix(path, "/history?") {
 			if history, ok := decoded.(map[string]any); ok {
@@ -218,13 +232,13 @@ func RegisterAgentProxyRoutes(r gin.IRouter, svc *app.Service, clients *agentops
 						outputs, err := svc.AssistantTurnOutputs(c.GetString("agentUserId"), strings.TrimSpace(c.Query("canvasId")), turnID)
 						if err != nil {
 							failService(c, err)
-							return
+							return false
 						}
 						turn["outputs"] = outputs
 						state, err := svc.ReadAssistantTurnHistoryState(c.GetString("agentUserId"), strings.TrimSpace(c.Query("canvasId")), turnID)
 						if err != nil {
 							failService(c, err)
-							return
+							return false
 						}
 						if state != nil {
 							turn["undone"] = state.Undone
@@ -236,6 +250,7 @@ func RegisterAgentProxyRoutes(r gin.IRouter, svc *app.Service, clients *agentops
 			}
 		}
 		ok(c, decoded)
+		return true
 	}
 
 	// requireOwnedCanvas 先验证 scope：只能操作当前用户确实拥有的画布，再转发给宿主。
@@ -276,7 +291,10 @@ func RegisterAgentProxyRoutes(r gin.IRouter, svc *app.Service, clients *agentops
 		if _, allowed := requireOwnedCanvas(c, payload.CanvasID); !allowed {
 			return
 		}
-		hostJSON(c, http.MethodPost, "/sessions", body)
+		if hostJSON(c, http.MethodPost, "/sessions", body) {
+			// 新建会话就是一条新模型的会话：这条画布上的旧「换模型」提示到此失效。
+			warnings.clear(c.GetString("agentUserId"), payload.CanvasID)
+		}
 	})
 
 	r.POST("/assistant/sessions/activate", func(c *gin.Context) {
@@ -293,6 +311,8 @@ func RegisterAgentProxyRoutes(r gin.IRouter, svc *app.Service, clients *agentops
 		if _, allowed := requireOwnedCanvas(c, payload.CanvasID); !allowed {
 			return
 		}
+		// 激活不改动提示：切回钉死模型的旧会话时它仍然成立，
+		// 是否继续存在交给下一条回合的结束结果判定。
 		hostJSON(c, http.MethodPost, "/sessions/activate", body)
 	})
 
@@ -480,16 +500,22 @@ func RegisterAgentProxyRoutes(r gin.IRouter, svc *app.Service, clients *agentops
 		if resp.StatusCode/100 != 2 {
 			settle = true
 			// 宿主拒绝这次对话时没有流可转：按统一失败信封回，reason 保持宿主给的机器可读原因。
-			payload, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
+			rejectionBody, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
 			var rejection struct {
 				Reason string `json:"reason"`
 			}
-			_ = json.Unmarshal(payload, &rejection)
+			_ = json.Unmarshal(rejectionBody, &rejection)
 			reason := strings.TrimSpace(rejection.Reason)
 			if reason == "" {
 				reason = "host_unreachable"
 			}
-			c.JSON(resp.StatusCode, gin.H{"code": resp.StatusCode, "reason": reason, "msg": "内置创作助手宿主拒绝了这次对话"})
+			message := "内置创作助手宿主拒绝了这次对话"
+			if actionable, found := assistant.HostTurnReasonMessage(reason); found {
+				message = actionable
+			}
+			// 拒绝也可能带会话级原因：这里记下，界面轮询状态时才能拿到可行动提示。
+			warnings.observeRejection(c.GetString("agentUserId"), payload.CanvasID, reason)
+			c.JSON(resp.StatusCode, gin.H{"code": resp.StatusCode, "reason": reason, "msg": message})
 			return
 		}
 		c.Status(resp.StatusCode)
@@ -502,8 +528,12 @@ func RegisterAgentProxyRoutes(r gin.IRouter, svc *app.Service, clients *agentops
 			line, readErr := reader.ReadBytes('\n')
 			// EOF is an observer failure, not proof that the durable task ended.
 			// A matching terminal receipt or the host-only completion endpoint settles.
-			if assistantTerminalLine(line, turnID) {
+			terminal, errorReason := assistantTurnEndOutcome(line, turnID)
+			if terminal {
 				settle = true
+				// turn_end 上的 errorReason 是后端唯一能看到的「这条会话钉死了别的模型」信号；
+				// 只观测，不改写转发给浏览器的原文。
+				warnings.observeTurnEnd(c.GetString("agentUserId"), payload.CanvasID, errorReason)
 			}
 			line = assistantOutputsLine(line, svc, c.GetString("agentUserId"), payload.CanvasID, turnID)
 			if len(line) > 0 && !clientGone {
@@ -624,12 +654,18 @@ func RegisterAgentProxyRoutes(r gin.IRouter, svc *app.Service, clients *agentops
 	})
 }
 
-func assistantTerminalLine(line []byte, turnID string) bool {
+// assistantTurnEndOutcome 判断这行是不是后端已经认领的那条 turn_end，并取出宿主回报的
+// errorReason（可能是会话级原因，也可能是空）。判定条件与原来一致：type 与 turnId 都要匹配。
+func assistantTurnEndOutcome(line []byte, turnID string) (terminal bool, errorReason string) {
 	var event struct {
-		Type   string `json:"type"`
-		TurnID string `json:"turnId"`
+		Type        string `json:"type"`
+		TurnID      string `json:"turnId"`
+		ErrorReason string `json:"errorReason"`
 	}
-	return json.Unmarshal(line, &event) == nil && event.Type == "turn_end" && event.TurnID == turnID
+	if json.Unmarshal(line, &event) != nil || event.Type != "turn_end" || event.TurnID != turnID {
+		return false, ""
+	}
+	return true, strings.TrimSpace(event.ErrorReason)
 }
 
 // readAssistantBody 读取并解析小型 JSON 请求体，返回原文与解析结果（原文用于原样转给宿主）。

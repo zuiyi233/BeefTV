@@ -34,11 +34,14 @@ func TestRuntimeLifecycleRequiresHostAndFencesStoppedTurn(t *testing.T) {
 
 func TestTerminalLineRequiresMatchingBusinessTurn(t *testing.T) {
 	for _, line := range []string{`{"type":"turn_end"}`, `{"type":"turn_end","turnId":"foreign"}`, `{"type":"text_delta","turnId":"owned"}`} {
-		if assistantTerminalLine([]byte(line), "owned") {
+		if terminal, _ := assistantTurnEndOutcome([]byte(line), "owned"); terminal {
 			t.Fatalf("false completion %s", line)
 		}
 	}
-	if !assistantTerminalLine([]byte(`{"type":"turn_end","turnId":"owned"}`), "owned") {
-		t.Fatal("completion receipt rejected")
+	if terminal, reason := assistantTurnEndOutcome([]byte(`{"type":"turn_end","turnId":"owned"}`), "owned"); !terminal || reason != "" {
+		t.Fatalf("completion receipt rejected: terminal=%v reason=%q", terminal, reason)
+	}
+	if terminal, reason := assistantTurnEndOutcome([]byte(`{"type":"turn_end","turnId":"owned","errorReason":"session_model_changed"}`), "owned"); !terminal || reason != "session_model_changed" {
+		t.Fatalf("terminal line must carry the host reason: terminal=%v reason=%q", terminal, reason)
 	}
 }

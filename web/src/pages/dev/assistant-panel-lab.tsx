@@ -12,7 +12,7 @@ import { CanvasNodeType } from "@/types/canvas";
  * DEV 实验室：只为验收助手停靠栏的视觉与状态分支。
  *
  * 不连后端、不调模型：所有数据都是本页写死的样例，用查询参数切换场景
- * （?state=ready|unavailable|starting&narrow=1&dark=1）。生产构建不含此路由。
+ * （?state=ready|unavailable|starting|no-model|session-changed&narrow=1&dark=1）。生产构建不含此路由。
  */
 const REFERENCES: CanvasResourceReference[] = [
     { id: "n1", nodeId: "n1", kind: "text", label: "镜头1", title: "镜头1-开场", active: true, sourceType: CanvasNodeType.Text, mentionToken: "@[node:n1]" },
@@ -112,7 +112,10 @@ export default function AssistantPanelLab() {
               ? { available: false, reason: "host_starting" }
               : state === "no-model"
                 ? { available: false, reason: "model_not_configured" }
-                : { available: true, model: { id: "deepseek-v3", channelId: "beefapi", channelName: "BeefAPI" } };
+                : state === "session-changed"
+                  // 会话级提示：宿主仍然可用，输入框和新消息都不能被它拦住，只多一条新建对话出路。
+                  ? { available: true, model: { id: "deepseek-v3", channelId: "beefapi", channelName: "BeefAPI" }, sessionWarning: "session_model_changed" }
+                  : { available: true, model: { id: "deepseek-v3", channelId: "beefapi", channelName: "BeefAPI" } };
 
     const assistant = stubController(open, setOpen, width, setWidth, status);
     if (state === "interrupted") {

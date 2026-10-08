@@ -1,6 +1,6 @@
 // 内置创作助手：浏览器只与同源 Go 代理通信，宿主/owner/模型凭据都不进入页面。
 // 三个端点的真实路径都在 /api/assistant/* 下；写错路径会让面板永远拿不到回复。
-import { ApiError, apiBaseURL, http } from "./request";
+import { ApiError, apiBaseURL, http, serializeApiParams } from "./request";
 import { assertUserScope, captureUserScope, userScopeMatches, type CapturedUserScope } from "@/lib/user-scope-guard";
 
 /** 后端给出的不可用原因（穷举，见契约 A1）；未知值一律走兜底文案。 */
@@ -30,6 +30,12 @@ export type AgentHostStatus = {
     model?: AssistantModelInfo;
     url?: string;
     health?: { raw?: string };
+    /**
+     * 会话级提示（值就是后端 reason，目前只有 "session_model_changed"）：
+     * 宿主与模型都是好的，只有「这条对话在别的模型下开始」这一件事需要出路。
+     * available 仍为 true，界面不得因为它禁用输入或新建对话。
+     */
+    sessionWarning?: string;
 };
 
 export type AgentToolCall = {
@@ -173,14 +179,23 @@ export function agentAssistantFailureText(reason: string | undefined, fallback =
             return "你已经换到别的对话了，请重新发送这条消息";
         case "session_not_running":
             return "这一轮已经结束，请查看最新结果后发送新消息";
+        // 会话级原因，不是宿主级：模型本身可用，只有这条对话绑不回当前模型。
+        // 文案与后端 SessionModelChangedMessage 保持同一口径，改一处要改两处。
+        case "session_model_changed":
+            return "这一轮开始时用的是另一个模型，创作助手没有执行它。现在已改用当前模型，重新发送这条要求即可继续；也可以新建对话，历史仍然可以查看。";
         default:
             return fallback;
     }
 }
 
-export async function getAgentHostStatus(): Promise<AgentHostStatus> {
-    const data = await http.get<AgentHostStatus>("/assistant/status");
-    return data;
+/**
+ * 助手状态。canvasId 只决定后端是否附带会话级提示（sessionWarning）：
+ * 后端按「当前用户 + 这条画布」记录观测到的会话级原因，不带画布时这个字段不出现，
+ * available 的判定与它无关。
+ */
+export async function getAgentHostStatus(canvasId?: string): Promise<AgentHostStatus> {
+    const query = serializeApiParams({ canvasId: canvasId || undefined }).toString();
+    return http.get<AgentHostStatus>(`/assistant/status${query ? `?${query}` : ""}`);
 }
 
 /** UI 会话头由页面内存里的凭据提供；助手的每条路由都走同一套认证。 */

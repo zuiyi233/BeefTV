@@ -532,9 +532,16 @@ paths:
       tags: [assistant]
       security: []
       summary: 内置创作助手宿主状态（免身份、不含凭据）
+      parameters:
+        - name: canvasId
+          in: query
+          required: false
+          schema:
+            type: string
+          description: 可选，只用于附带这条画布的会话级提示；不参与宿主可用性判定，解析不出当前用户时不附带任何提示
       responses:
         "200":
-          description: 信封 data 为 { available, reason?, url?, health? }；未就绪时给出明确原因
+          description: 信封 data 为 { available, reason?, url?, health?, sessionWarning? }；未就绪时给出明确原因。sessionWarning 仅在 available:true 且本进程在这条画布上观测到会话级原因时出现，取值为 session_model_changed（改绑前那一轮没执行）；它不是可用性判据，available 不受影响
   /assistant/ui-session:
     post:
       tags: [assistant]
@@ -555,6 +562,9 @@ paths:
         宿主凭据与模型密钥由后端注入，浏览器不接触。
         X-Beeftv-Turn-Admission 响应头为 rejected（尚未尝试创建业务轮次）、unknown（已尝试创建）或 admitted（已创建）。
         只有 rejected 可以确认未接纳；缺少标记、网络故障或接纳后失败仍需读取回执。续签凭据不会重放消息。
+        turn_end 的 errorReason 可能是 session_model_changed：这是会话级原因（宿主在接管这条对话时已把它改绑到当前模型，
+        只有改绑之前已经建立 checkpoint 的那一轮没能执行），宿主与当前模型本身可用，重新发送那一条要求即可继续。
+        宿主直接拒绝这次对话时，后端按宿主的状态码回信封，reason 原样透传不做改写，session_model_changed 会带上可行动的 msg。
       responses:
         "200":
           description: application/x-ndjson 事件流

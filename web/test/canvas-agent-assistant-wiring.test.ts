@@ -29,7 +29,25 @@ describe("助手前端接线", () => {
         expect(source).not.toContain("/api/agent/chat");
         expect(source).not.toContain("/api/agent/cancel");
         expect(source).toContain('http.post<{ token: string; expiresAt: string }>("/assistant/ui-session"');
-        expect(source).toContain('http.get<AgentHostStatus>("/assistant/status")');
+        expect(source).toContain('http.get<AgentHostStatus>(`/assistant/status');
+        expect(source).toContain("serializeApiParams({ canvasId");
+    });
+
+    /**
+     * 会话级提示（available:true + sessionWarning）必须只出一条说明和新建对话出路：
+     * 它既不能改 available 判定，也不能参与输入可用性，否则新建对话和新消息都会被误拦。
+     */
+    test("会话级提示带画布读取、接到既有新建会话流程且不拦住输入", () => {
+        expect(source).toContain("sessionWarning?: string");
+        expect(hook).toContain("getAgentHostStatus(canvasId)");
+        expect(hook).toContain("getAgentHostStatus(activeCanvasRef.current)");
+        expect(hook).toContain("waitForAssistant(controller.signal, getAgentHostStatus, targetCanvas)");
+        // 新建对话复用既有 startNewSession（内部就是 createAssistantSession 那条流程）。
+        expect(sidebar).toContain("assistantSessionNotice(assistant.status)");
+        expect(sidebar).toContain('onClick={() => void assistant.startNewSession()}>{sessionNotice.actionLabel}');
+        // 可用性判断只看只读与草稿读取，不掺会话级提示。
+        expect(sidebar).toContain("const composerDisabled = readOnly || !inputReady;");
+        expect(sidebar).not.toMatch(/composerDisabled =[^;]*sessionNotice/);
     });
 
     test("会话、历史、撤销、重启走契约里的路由，并带 UI 会话头", () => {

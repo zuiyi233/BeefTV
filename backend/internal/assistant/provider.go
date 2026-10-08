@@ -17,6 +17,25 @@ const (
 	ReasonProtocolUnsupported = "model_protocol_unsupported"
 )
 
+// ReasonSessionModelChanged 由宿主在「这条会话是在别的模型下开始的，
+// 在途 checkpoint 仍引用已经不存在的模型」时回报（契约字符串，不得改名）。
+// 它和上面三条不同层：模型本身是好的，坏的只是这条旧会话，
+// 所以 /assistant/status 必须继续声明 available:true，只额外带上会话级提示。
+const ReasonSessionModelChanged = "session_model_changed"
+
+// SessionModelChangedMessage 是后端信封里给这条原因的固定中文说明。
+// UI 仍按 reason 判定行为；msg 只保证即使界面没接新字段也不会显示成通用失败。
+const SessionModelChangedMessage = "这一轮开始时用的是另一个模型，创作助手没有执行它。现在已改用当前模型，重新发送这条要求即可继续；也可以新建对话，历史仍然可以查看。"
+
+// HostTurnReasonMessage 把宿主回报的回合原因映射成可公开的中文说明。
+// 未知原因返回 false：宿主正文不进响应，调用方保留自己的通用文案。
+func HostTurnReasonMessage(reason string) (string, bool) {
+	if strings.TrimSpace(reason) != ReasonSessionModelChanged {
+		return "", false
+	}
+	return SessionModelChangedMessage, true
+}
+
 // UnavailableError 承载稳定 reason，让 handler 直接投影成契约里的状态。
 type UnavailableError struct {
 	Reason  string

@@ -13,7 +13,7 @@ import { captureUserScope, userScopeMatches } from "@/lib/user-scope-guard";
 import { getActiveUserScope, getActiveUserScopeEpoch, subscribeUserScope } from "@/lib/user-scope";
 import { attachmentFromCanvasReference, attachmentRangeError, readAssistantInputDraft, saveAssistantInputDraft, uploadAssistantAttachment } from "@/services/assistant-attachments";
 import { CanvasAssistantAttachments } from "./canvas-assistant-attachments";
-import { ASSISTANT_CONTINUE_PROMPT, ASSISTANT_STARTER_PROMPTS, assistantStatusNotice, assistantVisibleReply } from "./canvas-assistant-copy";
+import { ASSISTANT_CONTINUE_PROMPT, ASSISTANT_STARTER_PROMPTS, assistantSessionNotice, assistantStatusNotice, assistantVisibleReply } from "./canvas-assistant-copy";
 import { CanvasAssistantComposer } from "./canvas-assistant-composer";
 import { CanvasAssistantReply, CanvasAssistantTurnView, CanvasAssistantUserMessage } from "./canvas-assistant-turn";
 import { ASSISTANT_MAX_WIDTH, ASSISTANT_MIN_WIDTH, type CanvasAssistantController } from "./use-canvas-assistant";
@@ -131,6 +131,8 @@ export function CanvasAssistantSidebar(props: Props) {
     }, [turnCount, assistant.streamed, assistant.pendingUserText, assistant.lifecycleNotice, props.proposalFeedback]);
 
     const notice = assistant.status && !assistant.status.available && assistant.status.reason !== "host_starting" ? assistantStatusNotice(assistant.status.reason) : null;
+    // 会话级提示与上面的不可用提示分层：宿主可用时才出现，且不参与任何输入可用性判断。
+    const sessionNotice = assistantSessionNotice(assistant.status);
     const inputReady = draftLoaded && loadedDraftIdentity === draftIdentity;
     const composerDisabled = readOnly || !inputReady;
     const composerReason = readOnly ? "这个画布是只读的，不能让助手改动。" : !draftLoaded ? "正在读取未发送内容…" : loadedDraftIdentity !== draftIdentity ? "未能读取草稿，请重新读取后继续。" : undefined;
@@ -193,6 +195,13 @@ export function CanvasAssistantSidebar(props: Props) {
                     ) : notice.action === "retry" ? (
                         <Button size="small" loading={assistant.statusBusy} onClick={() => void assistant.restartHost()}>{notice.actionLabel}</Button>
                     ) : null}
+                </div>
+            ) : null}
+
+            {sessionNotice ? (
+                <div className="canvas-assistant-notice" role="status">
+                    <span>{sessionNotice.text}</span>
+                    <Button size="small" disabled={assistant.streaming || assistant.sessionBusy} onClick={() => void assistant.startNewSession()}>{sessionNotice.actionLabel}</Button>
                 </div>
             ) : null}
 

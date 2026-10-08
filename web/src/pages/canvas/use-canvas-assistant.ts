@@ -228,14 +228,15 @@ export function useCanvasAssistant({ canvasId, onCanvasChanged }: Options) {
         if (!open) return;
         let cancelled = false;
         const refresh = () => {
-            getAgentHostStatus()
+            // 带上 canvasId 才拿得到会话级提示（sessionWarning）；它不影响 available。
+            getAgentHostStatus(canvasId)
                 .then((value) => { if (!cancelled && userScopeMatches(expectedScope)) setStatus(value); })
                 .catch(() => { if (!cancelled && userScopeMatches(expectedScope)) setStatus({ available: false }); });
         };
         refresh();
         const timer = setInterval(refresh, starting ? 2000 : 15000);
         return () => { cancelled = true; clearInterval(timer); };
-    }, [open, starting, expectedScope]);
+    }, [open, starting, expectedScope, canvasId]);
 
     const loadHistory = useCallback(async (targetCanvas: string, sessionId?: string) => {
         if (!userScopeMatches(expectedScope)) return false;
@@ -376,7 +377,7 @@ export function useCanvasAssistant({ canvasId, onCanvasChanged }: Options) {
                 if (persistence.dirty || persistence.status === "error") throw new Error("助手模型还没保存成功，请稍后重试");
             }
             controller.signal.throwIfAborted();
-            const ready = await waitForAssistant(controller.signal);
+            const ready = await waitForAssistant(controller.signal, getAgentHostStatus, targetCanvas);
             assertUserScope(expectedScope);
             setStatus(ready);
             if (!run.historyLoaded && !await loadHistory(targetCanvas)) throw new Error("对话还没读回来，请重新读取后再发送");
@@ -533,6 +534,11 @@ export function useCanvasAssistant({ canvasId, onCanvasChanged }: Options) {
             run.historyLoaded = true;
             run.historyError = null;
             void loadHistory(targetCanvas);
+            // 新建会话后端就把这条画布的「换过模型」提示清掉了：立刻复查一次状态，
+            // 不让它停留到下一次轮询，否则用户会看到刚建好的对话还被提示着要新建对话。
+            void getAgentHostStatus(targetCanvas)
+                .then((value) => { if (userScopeMatches(expectedScope) && activeCanvasRef.current === targetCanvas) setStatus(value); })
+                .catch(() => { /* 复查失败不改变已新建成功的结果，常规轮询仍会补上。 */ });
         } catch {
             run.error = "没能新建对话，当前对话仍然保留。请重试。";
         } finally {
@@ -593,7 +599,7 @@ export function useCanvasAssistant({ canvasId, onCanvasChanged }: Options) {
         try {
             await restartAgentHost();
             if (!userScopeMatches(expectedScope)) return;
-            const nextStatus = await getAgentHostStatus();
+            const nextStatus = await getAgentHostStatus(activeCanvasRef.current);
             if (userScopeMatches(expectedScope)) setStatus(nextStatus);
         } catch {
             if (userScopeMatches(expectedScope)) setStatus({ available: false, reason: "host_start_failed" });

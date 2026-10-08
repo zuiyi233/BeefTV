@@ -1,6 +1,6 @@
 // 助手面板里所有用户可见文案的唯一来源：机器可读原因、操作名和改动摘要都在这里
 // 翻译成用户语。组件只负责排版，不自己拼文案，避免同一种状态在两处写出两句话。
-import type { AgentLifecycleEvent, AgentToolCall, AssistantGenerationProposal, AssistantTurnChange, AssistantUndoFailure } from "@/services/api/agent-assistant";
+import { agentAssistantFailureText, type AgentHostStatus, type AgentLifecycleEvent, type AgentToolCall, type AssistantGenerationProposal, type AssistantTurnChange, type AssistantUndoFailure } from "@/services/api/agent-assistant";
 import { seedancePortraitLabel } from "@/lib/seedance-portrait";
 
 export type AssistantStatusAction = "model-settings" | "retry";
@@ -13,8 +13,24 @@ export type AssistantStatusNotice = {
     starting?: boolean;
 };
 
+/** 后端 reason 契约值：这条对话是在别的模型下开始的。 */
+export const ASSISTANT_SESSION_MODEL_CHANGED = "session_model_changed";
+
+/** 会话级提示：与不可用提示分层，宿主可用，只是这条对话需要新建一条。 */
+export type AssistantSessionNotice = { text: string; actionLabel: string };
+
 /** 兜底文案：原因缺失或后端给了我们还不认识的值时用这一句。 */
 export const ASSISTANT_UNAVAILABLE_FALLBACK = "助手暂时用不了，请稍后再试";
+
+/**
+ * 只在后端明确声明 available:true 时才给出会话级提示：
+ * 不可用时上面那条阻断提示已经在处理，这里再出一条只会互相矛盾。
+ * 未知原因值一律返回 null，界面维持原样，不显示后端原文。
+ */
+export function assistantSessionNotice(status: AgentHostStatus | null | undefined): AssistantSessionNotice | null {
+    if (!status || status.available !== true || status.sessionWarning !== ASSISTANT_SESSION_MODEL_CHANGED) return null;
+    return { text: agentAssistantFailureText(status.sessionWarning), actionLabel: "新建对话" };
+}
 
 export function assistantStatusNotice(reason: string | undefined): AssistantStatusNotice {
     switch (reason) {
