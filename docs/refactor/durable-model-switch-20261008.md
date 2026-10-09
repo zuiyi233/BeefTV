@@ -62,11 +62,23 @@ Windows 宿主机开发形态实测，上游同步到 `4b60dd4`（v1.7.13 之后
 - `backend`：`go build ./...`、`go vet ./internal/assistant ./internal/handler`、`gofmt -l` 全干净；`go test ./internal/assistant` ok；`TestTerminalLineRequiresMatchingBusinessTurn` 与 `TestAssistantSessionWarningStoreScopesAndExpiry` 通过。另三条 handler 用例的失败全部发生在 `t.TempDir()` 清理阶段的 `unlinkat ... assistant.db ... used by another process`，断言本身没有失败——同文件里改动前就存在的 `TestAssistantStatusReportsResolvedModelAndReasons` 等既有用例以完全相同的方式失败，属「跨平台测试基线」记录的既有噪音。
 - `web`：`bun run build`（`tsc --noEmit` + `vite build`）EXIT=0；`assistant-session-model-changed.test.ts`、`canvas-agent-assistant-wiring.test.ts`、`assistant-readiness.test.ts` 合计 19 pass / 0 fail。
 
+## 桌面打包形态验收
+
+`scripts/build-beeftv-windows-release.ps1` 在 Windows 本机原生构建（`go1.26.7` + `C:\msys64\mingw64\bin\gcc.exe` CGO，随包 Node 24.15.0），产出 `backend\cmd\desktop\build\bin\BeefTV.exe`（v1.7.13）、`agent-host\runtime\node.exe`、87 个官方 `*.beeftv-plugin` 与 `cli\beeftv.exe`。随包的 `agent-host\durable-session-owner.mjs` 与仓库内文件 SHA-256 一致，即改绑逻辑确实进了包。
+
+用**独立数据目录**启动该 exe（不指向 `%APPDATA%\BeefTV`）后的实测：
+
+- 窗口正常渲染（WebView2 子进程在位，首页左下版本角标 v1.7.13）；不带 `X-Desktop-Token` 的 `/api/assistant/status` 返回 403，入口守卫在包内生效。
+- owner 凭据下 `/api/ops` 给出 27 个操作，`/api/plugins` 为 89 个 `source=official` 且 `enabled`，插件确实从 exe 同目录加载。
+- `/api/assistant/status` 从 `model_not_configured` 变为 `available: true`：宿主由**随包 Node** 拉起，不依赖系统 Node。
+- 换模型回归：同一条 durable 会话先在 MiniCPM5-1B 上跑一轮（回复 `received`），把助手模型换成 Qwen3.6-27B 并 `POST /api/assistant/host/restart`，**同一 sessionId** 的下一轮正常回复「收到」，`errorReason` 为空；`/api/assistant/status?canvasId=...` 不带 `sessionWarning`。打包形态的改绑因此不再需要新建对话。
+- 凭据路径：桌面默认数据目录是 `%APPDATA%\BeefTV`。本次把数据目录放到非系统卷时，实测 `agent_owner_token` 的 DACL 继承 `NT AUTHORITY\Authenticated Users:(I)(M)` 与 `BUILTIN\Users:(I)(RX)`，即那里的「0600」并不成立——与 AGENTS.md 的既有结论一致，冒烟数据目录已在验收后删除。
+
 ## 仍未验证
 
 - 真实付费模型渠道下的换模型行为：本轮取证来自本地推理服务与测试宿主。
-- 桌面打包形态（随包 Node、`-tags desktop,production`）里的宿主改绑与凭据路径。
 - `chatgpt-subscription` 渠道：账号隔离头只在该协议下由 `applyAssistantSubscriptionHeaders` 注入，只能用真实订阅验证。
+- NSIS 安装包：该脚本只产出可执行目录，不产出安装器，安装/升级路径未在包内验证。
 - 上游反馈仍未提单：向 `glanderness/BeefTV` 或 pi-durable 说明「会话钉死模型引用 + status 仍 available」这一组合（本表四组数据可直接作为复现步骤）；改绑走 `configure` 而不是 `root()` 也值得回给上游确认。
 
 ## 相关本地事实
